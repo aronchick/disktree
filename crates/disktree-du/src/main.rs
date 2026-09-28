@@ -4,6 +4,12 @@
 //! Installed as `disktree-du`, and meant to be linked as `du` somewhere
 //! early on `PATH` so that whatever already runs `du` gets it.
 
+// On Windows only the command line is parsed; nothing is walked or printed.
+#![cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "Windows has no st_dev, st_ino or st_blocks")
+)]
+
 mod args;
 mod exclude;
 mod num;
@@ -96,46 +102,47 @@ struct Prepared {
 }
 
 /// Where the change journal of `root`'s volume stands, if it keeps one.
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn journal_position(root: &walk::Root) -> Option<index::Position> {
-    #[cfg(target_os = "macos")]
-    if let Ok(meta) = root.meta {
-        let uuid = fsevents::volume_uuid(meta.dev)?;
-        return Some((uuid, fsevents::current_event()));
-    }
-    let _ = root;
+    let meta = root.meta.ok()?;
+    let uuid = fsevents::volume_uuid(meta.dev)?;
+    Some((uuid, fsevents::current_event()))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+const fn journal_position(_root: &walk::Root) -> Option<index::Position> {
     None
 }
 
 /// What the journal recorded under `root` since `snapshot`, when it can
 /// vouch for the whole interval.
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn replay(
     snapshot: &index::Snapshot,
     root: &walk::Root,
     now: Option<index::Position>,
 ) -> Option<refresh::Journal> {
-    #[cfg(target_os = "macos")]
-    {
-        // An escape hatch, and how the tests reach the other path.
-        if std::env::var_os("DISKTREE_DU_JOURNAL").is_some_and(|v| v == "0") {
-            return None;
-        }
-        let ((then_uuid, since), (now_uuid, _)) = (snapshot.journal?, now?);
-        if then_uuid != now_uuid {
-            return None;
-        }
-        let path = walk::bytes_path(&root.path);
-        let base = std::fs::canonicalize(path).ok()?;
-        let base = base.as_os_str().as_encoded_bytes();
-        let changes = fsevents::changes_since(base, since)?;
-        Some(refresh::Journal::new(base, &changes))
+    // An escape hatch, and how the tests reach the other path.
+    if std::env::var_os("DISKTREE_DU_JOURNAL").is_some_and(|v| v == "0") {
+        return None;
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (snapshot, root, now);
-        None
+    let ((then_uuid, since), (now_uuid, _)) = (snapshot.journal?, now?);
+    if then_uuid != now_uuid {
+        return None;
     }
+    let base = std::fs::canonicalize(walk::bytes_path(&root.path)).ok()?;
+    let base = base.as_os_str().as_encoded_bytes();
+    let changes = fsevents::changes_since(base, since)?;
+    Some(refresh::Journal::new(base, &changes))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+const fn replay(
+    _snapshot: &index::Snapshot,
+    _root: &walk::Root,
+    _now: Option<index::Position>,
+) -> Option<refresh::Journal> {
+    None
 }
 
 #[cfg(unix)]

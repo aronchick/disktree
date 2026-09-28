@@ -813,8 +813,9 @@ disktree additions (full names only):
                           its kind, why it can be had back, the command
                           that frees it, and when it was last written
       --fresh           walk everything again and rewrite the index
-      --max-age=AGE     answer from the index without walking when it is
-                          younger than AGE (seconds, or 30s 10m 2h 1d)
+      --max-age=AGE     when the last walk is younger than AGE (seconds, or
+                          30s 10m 2h 1d), bring it up to date from what
+                          changed since instead of walking again
       --no-index        neither read nor write the persistent index
   The same through the environment, for use behind a `du` symlink:
   DISKTREE_DU_JSON=1 DISKTREE_DU_FRESH=1 DISKTREE_DU_MAX_AGE=AGE

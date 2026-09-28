@@ -75,6 +75,10 @@ impl Meta {
         }
     }
 
+    #[allow(
+        trivial_numeric_casts,
+        reason = "the mode is a u16 on some systems and a u32 on others"
+    )]
     pub const fn file_type(&self) -> FileType {
         FileType::from_raw_mode(self.mode as rustix::fs::RawMode)
     }
@@ -137,7 +141,19 @@ pub struct Root {
     pub dir: Option<Arc<Slot>>,
 }
 
+/// Whether the bulk attribute listing is in use.
+#[cfg(target_os = "macos")]
+fn bulk_enabled() -> bool {
+    crate::bulk::enabled()
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn bulk_enabled() -> bool {
+    false
+}
+
 /// A byte string as a path; on Unix any byte string is one.
+#[cfg(target_os = "macos")]
 pub fn bytes_path(bytes: &[u8]) -> &std::path::Path {
     use std::os::unix::ffi::OsStrExt as _;
     std::path::Path::new(std::ffi::OsStr::from_bytes(bytes))
@@ -257,11 +273,7 @@ impl<'a> Walker<'a> {
     /// Whether listings from the index can save this walk any work. With
     /// macOS's bulk attributes a directory costs one call either way.
     pub fn reuses_listings(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        if self.deref != Deref::All && crate::bulk::enabled() {
-            return false;
-        }
-        true
+        !(self.deref != Deref::All && bulk_enabled())
     }
 
     /// Whether the walk goes into this operand at all. An excluded operand

@@ -34,6 +34,7 @@ use crate::walk::{
 const RECENT_SECS: i64 = 60 * 60;
 
 /// What the journal says changed, as absolute paths.
+#[cfg(target_os = "macos")]
 #[derive(Debug, Default)]
 pub struct Changes {
     /// Directories whose entries, or whose files, changed.
@@ -56,6 +57,7 @@ pub struct Journal {
 impl Journal {
     /// Turn the journal's absolute paths into paths below `base`, the
     /// operand's canonical path, ignoring anything outside it.
+    #[cfg(target_os = "macos")]
     pub fn new(base: &[u8], changes: &Changes) -> Self {
         let relative = |path: &[u8]| -> Option<Vec<u8>> {
             if path == base {

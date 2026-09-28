@@ -11,6 +11,35 @@ use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+/// The coreutils release disktree-du follows. Older ones differ in a few
+/// places, listed in [`CHANGED_SINCE`].
+const FOLLOWS: (u32, u32) = (9, 11);
+
+/// The oldest GNU du compared against. Before 9.2, `--apparent-size` counted
+/// a directory's own size, and messages began with the full `argv[0]`.
+const OLDEST: (u32, u32) = (9, 4);
+
+/// Cases whose GNU output changed after [`OLDEST`], compared only against a
+/// GNU du as new as [`FOLLOWS`].
+const CHANGED_SINCE: &[&[&str]] = &[
+    // The maximum depth became signed: -1 no longer wraps to "everything".
+    &["-d", "-1"],
+    // The list of valid time styles is worded differently.
+    &["--time-style=bogus", "--time"],
+];
+
+fn version(gnu: &Path) -> (u32, u32) {
+    let output = Command::new(gnu).arg("--version").output().expect("run");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let number = text
+        .lines()
+        .next()
+        .and_then(|line| line.rsplit(' ').next())
+        .unwrap_or_default();
+    let mut parts = number.split('.').map(|part| part.parse().unwrap_or(0));
+    (parts.next().unwrap_or(0), parts.next().unwrap_or(0))
+}
+
 fn gnu_du() -> Option<PathBuf> {
     for name in ["gdu", "du"] {
         let Ok(output) = Command::new(name).arg("--version").output() else {
@@ -121,16 +150,27 @@ fn show(output: &Output) -> String {
     )
 }
 
-/// Standard error with the binary's full path, which `getopt` and the
-/// "Try ... --help" line repeat, replaced by a placeholder.
+/// Standard error with the program's name replaced by a placeholder: the
+/// full path `getopt` and the "Try ... --help" line repeat, and the name
+/// messages start with, which is the basename since coreutils 9.2 and the
+/// full path before.
 fn stderr(output: &Output, program: &Path) -> Vec<u8> {
+    let base = program.file_name().expect("name").to_string_lossy();
     String::from_utf8_lossy(&output.stderr)
         .replace(&program.display().to_string(), "DU")
+        .lines()
+        .map(|line| match line.strip_prefix(&format!("{base}:")) {
+            Some(rest) => format!("DU:{rest}\n"),
+            None => format!("{line}\n"),
+        })
+        .collect::<String>()
         .into_bytes()
 }
 
 impl Harness {
-    fn check(&self, args: &[&str]) {
+    /// Compare one argument set; a mismatch is returned, not raised, so
+    /// that one run reports every case that differs.
+    fn check(&self, args: &[&str]) -> Option<String> {
         let gnu = run(&self.gnu, &self.cwd, args, &[]);
         let index = self.index.as_path();
         let one = Path::new("1");
@@ -156,16 +196,19 @@ impl Harness {
         ];
         for (pass, env) in passes {
             let ours = run(&self.ours, &self.cwd, args, &env);
-            assert!(
-                ours.stdout == gnu.stdout
-                    && stderr(&ours, &self.ours) == stderr(&gnu, &self.gnu)
-                    && ours.status.code() == gnu.status.code(),
-                "du {} ({pass})\n=== GNU\n{}\n=== disktree\n{}",
-                args.join(" "),
-                show(&gnu),
-                show(&ours)
-            );
+            if ours.stdout != gnu.stdout
+                || stderr(&ours, &self.ours) != stderr(&gnu, &self.gnu)
+                || ours.status.code() != gnu.status.code()
+            {
+                return Some(format!(
+                    "du {} ({pass})\n=== GNU\n{}\n=== disktree\n{}",
+                    args.join(" "),
+                    show(&gnu),
+                    show(&ours)
+                ));
+            }
         }
+        None
     }
 }
 
@@ -175,6 +218,11 @@ fn matches_gnu_du() {
         eprintln!("SKIPPED: no GNU du (install coreutils for gdu)");
         return;
     };
+    let version = version(&gnu);
+    if version < OLDEST {
+        eprintln!("SKIPPED: GNU du {version:?} predates {OLDEST:?}");
+        return;
+    }
     let temp = tempfile::TempDir::new().expect("tempdir");
     // Canonical, so both tools print the same path when given it.
     let base = temp.path().canonicalize().expect("canonical");
@@ -278,12 +326,21 @@ fn matches_gnu_du() {
         &["--", "-a"],
         &["a", "-s"],
     ];
-    for case in cases {
-        harness.check(case);
-    }
+    let failures: Vec<String> = cases
+        .iter()
+        .filter(|case| version >= FOLLOWS || !CHANGED_SINCE.contains(case))
+        .filter_map(|case| harness.check(case))
+        .collect();
 
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
         .expect("chmod");
+    assert!(
+        failures.is_empty(),
+        "{} of {} cases differ:\n\n{}",
+        failures.len(),
+        cases.len(),
+        failures.join("\n")
+    );
 }
 
 #[test]
@@ -311,7 +368,8 @@ fn json_describes_what_du_prints() {
 
 /// Set a file's modification time `seconds` into the past.
 fn age(path: &Path, seconds: u64) {
-    let when = std::time::SystemTime::now() - std::time::Duration::from_secs(seconds);
+    let when =
+        std::time::SystemTime::now() - std::time::Duration::from_secs(seconds);
     std::fs::File::options()
         .append(true)
         .open(path)
@@ -353,7 +411,9 @@ fn catches_up(journal: bool) {
         std::fs::OpenOptions::new()
             .append(true)
             .open(root.join("a/d/old"))
-            .and_then(|mut f| std::io::Write::write_all(&mut f, &vec![1; 300_000]))
+            .and_then(|mut f| {
+                std::io::Write::write_all(&mut f, &vec![1; 300_000])
+            })
             .expect("grow");
     }
     std::thread::sleep(std::time::Duration::from_millis(500));
@@ -361,7 +421,8 @@ fn catches_up(journal: bool) {
     let hour = Path::new("1h");
     let mut cached_env = env.clone();
     cached_env.push(("DISKTREE_DU_MAX_AGE", hour));
-    let cached = run(du, &root, &[&args[..], &["--json"]].concat(), &cached_env);
+    let cached =
+        run(du, &root, &[&args[..], &["--json"]].concat(), &cached_env);
     let want = if journal { "journal" } else { "directories" };
     assert_eq!(source_of(&cached), want, "{}", show(&cached));
     let cached = run(du, &root, &args, &cached_env);

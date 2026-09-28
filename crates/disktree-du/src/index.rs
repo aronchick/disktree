@@ -113,6 +113,10 @@ pub struct Snapshot {
     /// When the walk that produced it began.
     pub taken: Time,
     /// The journal's position then, where the volume keeps one.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "only macOS keeps a journal to replay")
+    )]
     pub journal: Option<Position>,
     /// When it was last confirmed by a walk: the file's modification time.
     pub confirmed: SystemTime,
@@ -391,8 +395,8 @@ fn put_time(out: &mut Vec<u8>, time: Time) {
 // An entry is a tag byte and then only what the tag says is there. Most
 // entries share their directory's device, have the inode `readdir` gave,
 // and were last changed when they were last modified, so those three are
-// written only when they differ. Access times are not kept: nothing reads
-// them back (see `Snapshot::trusted`).
+// written only when they differ. Access times are not kept: a walk reads
+// them afresh, and `--max-age` does not answer `--time=atime`.
 const META_OK: u8 = 0;
 const META_ERRNO: u8 = 1;
 const META_DANGLING: u8 = 2;
