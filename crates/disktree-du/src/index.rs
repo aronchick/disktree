@@ -42,7 +42,7 @@ use crate::walk::{
     Entry, ListError, Listing, Meta, Root, Slot, StatError, Time,
 };
 
-const MAGIC: &[u8; 8] = b"DTDUIDX1";
+const MAGIC: &[u8; 8] = b"DTDUIDX2";
 
 /// How much older than the walk a directory's ctime must be before its
 /// listing is trusted. Two seconds covers file systems with one-second
@@ -131,9 +131,9 @@ impl Snapshot {
             return None;
         }
         let taken = reader.time()?;
-        let root = reader.meta()?;
+        let root = reader.meta(OWN_DEV | OWN_CTIME, 0)?;
         let tree = Arc::new(Slot::new());
-        let _ = tree.set(reader.listing()?);
+        let _ = tree.set(reader.listing(root.dev)?);
         if reader.at != bytes.len() {
             return None;
         }
@@ -265,8 +265,8 @@ pub fn save(
     let mut out = Vec::with_capacity(1 << 16);
     out.extend_from_slice(MAGIC);
     put_time(&mut out, taken);
-    put_meta(&mut out, &meta);
-    put_listing(&mut out, listing);
+    put_meta(&mut out, &meta, OWN_DEV | OWN_CTIME);
+    put_listing(&mut out, listing, meta.dev);
     let path = Snapshot::file(dir, options, &meta);
     let temp = path.with_extension(format!("tmp{}", std::process::id()));
     let result = (|| {
@@ -362,23 +362,41 @@ fn put_time(out: &mut Vec<u8>, time: Time) {
     put_u64(out, u64::from(time.nsec));
 }
 
-fn put_meta(out: &mut Vec<u8>, meta: &Meta) {
-    put_u64(out, meta.dev);
+// An entry is a tag byte and then only what the tag says is there. Most
+// entries share their directory's device, have the inode `readdir` gave,
+// and were last changed when they were last modified, so those three are
+// written only when they differ. Access times are not kept: nothing reads
+// them back (see `Snapshot::trusted`).
+const META_OK: u8 = 0;
+const META_ERRNO: u8 = 1;
+const META_DANGLING: u8 = 2;
+const META_MASK: u8 = 3;
+const HAS_DIR: u8 = 1 << 2;
+const OWN_DEV: u8 = 1 << 3;
+const OWN_D_INO: u8 = 1 << 4;
+const OWN_CTIME: u8 = 1 << 5;
+
+fn put_meta(out: &mut Vec<u8>, meta: &Meta, tag: u8) {
+    if tag & OWN_DEV != 0 {
+        put_u64(out, meta.dev);
+    }
     put_u64(out, meta.ino);
     put_u64(out, u64::from(meta.mode));
     put_u64(out, meta.nlink);
     put_u64(out, meta.blocks);
     put_i64(out, meta.size);
     put_time(out, meta.mtime);
-    put_time(out, meta.atime);
-    put_time(out, meta.ctime);
+    if tag & OWN_CTIME != 0 {
+        put_time(out, meta.ctime);
+    }
 }
 
 fn put_errno(out: &mut Vec<u8>, errno: Errno) {
     put_u64(out, u64::from(errno.raw_os_error().unsigned_abs()));
 }
 
-fn put_listing(out: &mut Vec<u8>, listing: &Listing) {
+/// `dev` is the device of the directory the listing is of.
+fn put_listing(out: &mut Vec<u8>, listing: &Listing, dev: u64) {
     match listing.error {
         None => put_u64(out, 0),
         Some(ListError::Unreadable(errno)) => {
@@ -392,26 +410,39 @@ fn put_listing(out: &mut Vec<u8>, listing: &Listing) {
     }
     put_u64(out, listing.entries.len() as u64);
     for entry in &listing.entries {
+        let child = entry.dir.as_deref().and_then(OnceLock::get);
+        let mut tag = if child.is_some() { HAS_DIR } else { 0 };
+        tag |= match entry.meta {
+            Ok(meta) => {
+                let mut own = META_OK;
+                if meta.dev != dev {
+                    own |= OWN_DEV;
+                }
+                if meta.ino != entry.d_ino {
+                    own |= OWN_D_INO;
+                }
+                if meta.ctime != meta.mtime {
+                    own |= OWN_CTIME;
+                }
+                own
+            }
+            Err(StatError::Errno(_)) => META_ERRNO | OWN_D_INO,
+            Err(StatError::Dangling) => META_DANGLING | OWN_D_INO,
+        };
+        out.push(tag);
         put_u64(out, entry.name.len() as u64);
         out.extend_from_slice(&entry.name);
-        put_u64(out, entry.d_ino);
-        match entry.meta {
-            Ok(meta) => {
-                out.push(0);
-                put_meta(out, &meta);
-            }
-            Err(StatError::Errno(errno)) => {
-                out.push(1);
-                put_errno(out, errno);
-            }
-            Err(StatError::Dangling) => out.push(2),
+        if tag & OWN_D_INO != 0 {
+            put_u64(out, entry.d_ino);
         }
-        match entry.dir.as_deref().and_then(OnceLock::get) {
-            Some(child) => {
-                out.push(1);
-                put_listing(out, child);
-            }
-            None => out.push(0),
+        match entry.meta {
+            Ok(meta) => put_meta(out, &meta, tag),
+            Err(StatError::Errno(errno)) => put_errno(out, errno),
+            Err(StatError::Dangling) => {}
+        }
+        if let Some(child) = child {
+            let child_dev = entry.meta.map_or(dev, |meta| meta.dev);
+            put_listing(out, child, child_dev);
         }
     }
 }
@@ -457,17 +488,29 @@ impl Reader<'_> {
         })
     }
 
-    fn meta(&mut self) -> Option<Meta> {
+    fn meta(&mut self, tag: u8, dev: u64) -> Option<Meta> {
+        let dev = if tag & OWN_DEV != 0 { self.u64()? } else { dev };
+        let ino = self.u64()?;
+        let mode = u32::try_from(self.u64()?).ok()?;
+        let nlink = self.u64()?;
+        let blocks = self.u64()?;
+        let size = self.i64()?;
+        let mtime = self.time()?;
+        let ctime = if tag & OWN_CTIME != 0 {
+            self.time()?
+        } else {
+            mtime
+        };
         Some(Meta {
-            dev: self.u64()?,
-            ino: self.u64()?,
-            mode: u32::try_from(self.u64()?).ok()?,
-            nlink: self.u64()?,
-            blocks: self.u64()?,
-            size: self.i64()?,
-            mtime: self.time()?,
-            atime: self.time()?,
-            ctime: self.time()?,
+            dev,
+            ino,
+            mode,
+            nlink,
+            blocks,
+            size,
+            mtime,
+            atime: mtime,
+            ctime,
         })
     }
 
@@ -475,7 +518,7 @@ impl Reader<'_> {
         Some(Errno::from_raw_os_error(i32::try_from(self.u64()?).ok()?))
     }
 
-    fn listing(&mut self) -> Option<Listing> {
+    fn listing(&mut self, dev: u64) -> Option<Listing> {
         let error = match self.u64()? {
             0 => None,
             1 => Some(ListError::Unreadable(self.errno()?)),
@@ -486,23 +529,32 @@ impl Reader<'_> {
         // A corrupt count must not become a huge allocation.
         let mut entries = Vec::with_capacity(count.min(self.bytes.len()));
         for _ in 0..count {
+            let tag = self.byte()?;
             let len = usize::try_from(self.u64()?).ok()?;
             let name: Box<[u8]> = self.take(len)?.into();
-            let d_ino = self.u64()?;
-            let meta = match self.byte()? {
-                0 => Ok(self.meta()?),
-                1 => Err(StatError::Errno(self.errno()?)),
-                2 => Err(StatError::Dangling),
+            let d_ino = if tag & OWN_D_INO != 0 {
+                Some(self.u64()?)
+            } else {
+                None
+            };
+            let meta = match tag & META_MASK {
+                META_OK => Ok(self.meta(tag, dev)?),
+                META_ERRNO => Err(StatError::Errno(self.errno()?)),
+                META_DANGLING => Err(StatError::Dangling),
                 _ => return None,
             };
-            let dir = match self.byte()? {
-                0 => None,
-                1 => {
-                    let slot = Arc::new(Slot::new());
-                    let _ = slot.set(self.listing()?);
-                    Some(slot)
-                }
-                _ => return None,
+            let d_ino = match (d_ino, meta) {
+                (Some(d_ino), _) => d_ino,
+                (None, Ok(meta)) => meta.ino,
+                (None, Err(_)) => return None,
+            };
+            let dir = if tag & HAS_DIR != 0 {
+                let child_dev = meta.map_or(dev, |meta| meta.dev);
+                let slot = Arc::new(Slot::new());
+                let _ = slot.set(self.listing(child_dev)?);
+                Some(slot)
+            } else {
+                None
             };
             entries.push(Entry {
                 name,
@@ -587,9 +639,9 @@ mod tests {
             ..Listing::default()
         };
         let mut out = Vec::new();
-        put_listing(&mut out, &listing);
+        put_listing(&mut out, &listing, 7);
         let mut reader = Reader { bytes: &out, at: 0 };
-        let back = reader.listing().expect("parses");
+        let back = reader.listing(7).expect("parses");
         assert_eq!(reader.at, out.len());
         assert_eq!(back.entries.len(), 2);
 

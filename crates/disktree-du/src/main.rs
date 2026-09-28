@@ -77,8 +77,11 @@ fn prepare(
         };
     };
     let mut root = walker.root(path);
+    // The snapshot is read only when it can help: to answer for `--max-age`,
+    // or where the walk can reuse its listings.
+    let wanted = options.max_age.is_some() || walker.reuses_listings();
     let snapshot = match (index_dir, root.meta) {
-        (Some(dir), Ok(meta)) if walker.descends(&root) => {
+        (Some(dir), Ok(meta)) if wanted && walker.descends(&root) => {
             index::Snapshot::load(index::Snapshot::file(dir, options, &meta))
         }
         _ => None,
@@ -86,6 +89,8 @@ fn prepare(
     if let (Some(snapshot), Some(max_age), Ok(meta)) =
         (&snapshot, options.max_age, root.meta)
         && !options.fresh
+        // The index keeps no access times to answer `--time=atime` with.
+        && !matches!(options.time, Some((args::TimeKind::Accessed, _)))
         && snapshot.trusted(max_age, &meta)
     {
         root.dir = Some(std::sync::Arc::clone(&snapshot.tree));
@@ -129,42 +134,10 @@ fn run(program: &str, options: &args::Options) -> ExitCode {
         .par_iter()
         .map(|operand| prepare(options, &walker, index_dir.as_deref(), operand))
         .collect();
-    let roots: Vec<Option<&walk::Root>> =
-        prepared.iter().map(|p| p.root.as_ref()).collect();
-
-    let time_format = options.time.as_ref().map(|(_, format)| format.clone());
-    let ok = if options.json {
-        let sink = output::Json::new(options.units, options.inodes);
-        let (ok, sink) = report_all(program, options, &roots, sink);
-        let (as_of, source) = provenance(&prepared, started);
-        let reused = prepared
-            .iter()
-            .filter(|p| p.from_index.is_none())
-            .filter_map(|p| p.root.as_ref())
-            .map(reused_listings)
-            .sum();
-        if sink.write(as_of, source, reused).is_err() {
-            return ExitCode::FAILURE;
-        }
-        ok
-    } else {
-        let sink = output::Text::new(
-            options.units,
-            options.inodes,
-            time_format,
-            options.null,
-        );
-        let (ok, sink) = report_all(program, options, &roots, sink);
-        if sink.is_broken() {
-            // Whoever was reading has gone; GNU would die of SIGPIPE.
-            return ExitCode::FAILURE;
-        }
-        ok
-    };
-
-    // The answer is out; now remember the walks for next time. The index
-    // is a cache, so a failure to write it is not du's failure.
-    if let Some(dir) = &index_dir {
+    // The index is written while the answer is printed; it is a cache, so
+    // failing to write it is not du's failure.
+    let save = || {
+        let Some(dir) = &index_dir else { return };
         prepared.par_iter().for_each(|p| {
             let Some(root) = p.root.as_ref().filter(|_| p.from_index.is_none())
             else {
@@ -182,12 +155,50 @@ fn run(program: &str, options: &args::Options) -> ExitCode {
             }
         });
         index::prune(dir);
-    }
-
-    if ok {
+    };
+    let (ok, ()) =
+        rayon::join(|| answer(program, options, &prepared, started), save);
+    if ok == Some(true) {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// Print the answer. `None` when standard output failed.
+#[cfg(unix)]
+fn answer(
+    program: &str,
+    options: &args::Options,
+    prepared: &[Prepared],
+    started: walk::Time,
+) -> Option<bool> {
+    let roots: Vec<Option<&walk::Root>> =
+        prepared.iter().map(|p| p.root.as_ref()).collect();
+    if options.json {
+        let sink = output::Json::new(options.units, options.inodes);
+        let (ok, sink) = report_all(program, options, &roots, sink);
+        let (as_of, source) = provenance(prepared, started);
+        let reused = prepared
+            .iter()
+            .filter(|p| p.from_index.is_none())
+            .filter_map(|p| p.root.as_ref())
+            .map(reused_listings)
+            .sum();
+        sink.write(as_of, source, reused).ok()?;
+        Some(ok)
+    } else {
+        let time_format =
+            options.time.as_ref().map(|(_, format)| format.clone());
+        let sink = output::Text::new(
+            options.units,
+            options.inodes,
+            time_format,
+            options.null,
+        );
+        let (ok, sink) = report_all(program, options, &roots, sink);
+        // Whoever was reading has gone; GNU would die of SIGPIPE.
+        (!sink.is_broken()).then_some(ok)
     }
 }
 

@@ -250,6 +250,16 @@ impl<'a> Walker<'a> {
         }
     }
 
+    /// Whether listings from the index can save this walk any work. With
+    /// macOS's bulk attributes a directory costs one call either way.
+    pub fn reuses_listings(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if self.deref != Deref::All && crate::bulk::enabled() {
+            return false;
+        }
+        true
+    }
+
     /// Whether the walk goes into this operand at all. An excluded operand
     /// is never visited, so neither is its content.
     pub fn descends(&self, root: &Root) -> bool {
