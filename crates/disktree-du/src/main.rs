@@ -130,8 +130,20 @@ fn replay(
     if then_uuid != now_uuid {
         return None;
     }
-    let base = std::fs::canonicalize(walk::bytes_path(&root.path)).ok()?;
-    let base = base.as_os_str().as_encoded_bytes();
+    // The journal names paths as they are on disk. `realpath` keeps the
+    // case an operand was typed in, which on a case-insensitive volume
+    // need not be the directory's; the kernel's own path for it does not.
+    let dir = rustix::fs::openat(
+        rustix::fs::CWD,
+        root.path.as_slice(),
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .ok()?;
+    let base = rustix::fs::getpath(&dir).ok()?;
+    let base = base.to_bytes();
     let changes = fsevents::changes_since(base, since)?;
     Some(refresh::Journal::new(base, &changes))
 }

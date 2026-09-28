@@ -443,3 +443,39 @@ fn max_age_catches_up_by_directory() {
 fn max_age_catches_up_through_the_journal() {
     catches_up(true);
 }
+
+/// On a case-insensitive volume an operand can be typed in another case
+/// than the directory's; the journal still has to be matched against it.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_journal_is_matched_in_the_case_on_disk() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canonical");
+    write(&root.join("Proj/old"), 20_000);
+    age(&root.join("Proj/old"), 7200);
+    if !root.join("proj").exists() {
+        eprintln!("SKIPPED: this volume is case-sensitive");
+        return;
+    }
+    let index = root.join("index");
+    let du = Path::new(env!("CARGO_BIN_EXE_disktree-du"));
+    let hour = Path::new("1h");
+    let env = [
+        ("DISKTREE_DU_INDEX_DIR", index.as_path()),
+        ("DISKTREE_DU_MAX_AGE", hour),
+    ];
+    run(du, &root, &["-s", "proj"], &env);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(root.join("Proj/old"))
+        .and_then(|mut f| std::io::Write::write_all(&mut f, &vec![1; 300_000]))
+        .expect("grow");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let cached = run(du, &root, &["-s", "proj"], &env);
+    let off = Path::new("0");
+    let walked = run(du, &root, &["-s", "proj"], &[("DISKTREE_DU_INDEX", off)]);
+    assert_eq!(
+        String::from_utf8_lossy(&cached.stdout),
+        String::from_utf8_lossy(&walked.stdout)
+    );
+}

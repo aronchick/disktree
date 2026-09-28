@@ -152,13 +152,6 @@ const fn bulk_enabled() -> bool {
     false
 }
 
-/// A byte string as a path; on Unix any byte string is one.
-#[cfg(target_os = "macos")]
-pub fn bytes_path(bytes: &[u8]) -> &std::path::Path {
-    use std::os::unix::ffi::OsStrExt as _;
-    std::path::Path::new(std::ffi::OsStr::from_bytes(bytes))
-}
-
 /// `fts_open` trims a run of trailing slashes on an operand to one, but
 /// leaves `//` alone.
 pub fn trim_operand(name: &[u8]) -> Vec<u8> {
