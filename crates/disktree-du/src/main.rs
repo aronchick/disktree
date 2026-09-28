@@ -9,6 +9,8 @@ mod exclude;
 mod num;
 mod quote;
 
+#[cfg(target_os = "macos")]
+mod bulk;
 #[cfg(unix)]
 mod index;
 #[cfg(unix)]

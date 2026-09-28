@@ -370,6 +370,34 @@ impl<'a> Walker<'a> {
             }
         };
         let follow = self.deref == Deref::All;
+        // Without links to follow, macOS hands over a whole directory's
+        // stats at once, which is cheaper than any listing the index could
+        // save a `readdir` of.
+        #[cfg(target_os = "macos")]
+        if let Some((items, failed)) = (!follow && crate::bulk::enabled())
+            .then(|| crate::bulk::read(fd.as_fd()))
+            .flatten()
+        {
+            let sort = inode_sort_useful(fd.as_fd());
+            let error = failed.map(|errno| {
+                if items.is_empty() {
+                    ListError::Unreadable(errno)
+                } else {
+                    ListError::Partial(errno)
+                }
+            });
+            let mut items = items;
+            for batch in items.chunks_mut(READDIR_BATCH) {
+                if sort && batch.len() > INODE_SORT_THRESHOLD {
+                    batch.sort_by_key(|item| item.id);
+                }
+            }
+            return Listing {
+                entries: stat_missing(fd.as_fd(), items),
+                error,
+                reused: false,
+            };
+        }
         if let Some(names) = previous.and_then(|previous| previous.names(meta))
         {
             return Listing {
@@ -435,6 +463,32 @@ impl<'a> Walker<'a> {
 fn sort_batch(batch: &mut [(Box<[u8]>, u64)], useful: bool) {
     if useful && batch.len() > INODE_SORT_THRESHOLD {
         batch.sort_by_key(|&(_, ino)| ino);
+    }
+}
+
+/// Entries from the bulk listing, with `fstatat` for those it could not
+/// describe exactly.
+#[cfg(target_os = "macos")]
+fn stat_missing(
+    dir: BorrowedFd<'_>,
+    items: Vec<crate::bulk::Item>,
+) -> Vec<Entry> {
+    let finish = |item: crate::bulk::Item| {
+        let meta = match item.meta {
+            Some(meta) => Ok(meta),
+            None => stat_at(dir, &item.name, false),
+        };
+        Entry {
+            name: item.name,
+            d_ino: item.id,
+            meta,
+            dir: None,
+        }
+    };
+    if items.len() >= PARALLEL_STATS {
+        items.into_par_iter().map(finish).collect()
+    } else {
+        items.into_iter().map(finish).collect()
     }
 }
 
