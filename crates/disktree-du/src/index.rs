@@ -21,9 +21,9 @@
 //!   began: any change after the listing was read gets a later ctime. This
 //!   is git's "racy clean" rule.
 //!
-//! * Trusted, with `--max-age`. A snapshot younger than the age asked for,
-//!   whose operand's own stat has not changed, is the answer: nothing is
-//!   walked. Its numbers are as of when it was taken, which `--json` says.
+//! * Caught up, with `--max-age`. A snapshot younger than the age asked for
+//!   is brought up to date from what changed since, without walking the
+//!   rest: see `crate::refresh`.
 //!
 //! The format is private to this version: a snapshot that does not parse
 //! exactly is treated as missing.
@@ -42,7 +42,7 @@ use crate::walk::{
     Entry, ListError, Listing, Meta, Root, Slot, StatError, Time,
 };
 
-const MAGIC: &[u8; 8] = b"DTDUIDX2";
+const MAGIC: &[u8; 8] = b"DTDUIDX3";
 
 /// How much older than the walk a directory's ctime must be before its
 /// listing is trusted. Two seconds covers file systems with one-second
@@ -102,12 +102,18 @@ pub const fn indexable(options: &Options) -> bool {
     options.index && !matches!(options.deref, Deref::All)
 }
 
+/// Where a change journal stood when a snapshot's walk began: the
+/// volume's journal UUID and the event id. See `crate::fsevents`.
+pub type Position = ([u8; 16], u64);
+
 /// One operand's snapshot, read back.
 #[derive(Debug)]
 pub struct Snapshot {
     path: PathBuf,
     /// When the walk that produced it began.
     pub taken: Time,
+    /// The journal's position then, where the volume keeps one.
+    pub journal: Option<Position>,
     /// When it was last confirmed by a walk: the file's modification time.
     pub confirmed: SystemTime,
     pub root: Meta,
@@ -131,6 +137,14 @@ impl Snapshot {
             return None;
         }
         let taken = reader.time()?;
+        let journal = match reader.byte()? {
+            0 => None,
+            1 => {
+                let uuid: [u8; 16] = reader.take(16)?.try_into().ok()?;
+                Some((uuid, reader.u64()?))
+            }
+            _ => return None,
+        };
         let root = reader.meta(OWN_DEV | OWN_CTIME, 0)?;
         let tree = Arc::new(Slot::new());
         let _ = tree.set(reader.listing(root.dev)?);
@@ -140,26 +154,22 @@ impl Snapshot {
         Some(Self {
             path,
             taken,
+            journal,
             confirmed,
             root,
             tree,
         })
     }
 
-    /// Whether this snapshot may stand in for a walk: young enough, and
-    /// the operand itself unchanged since.
-    pub fn trusted(&self, max_age: Duration, root: &Meta) -> bool {
-        let fresh = SystemTime::now()
-            .duration_since(self.confirmed)
-            .is_ok_and(|age| age <= max_age);
-        fresh && self.root.unchanged(root)
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
-    /// Mark the snapshot as confirmed now, without rewriting it.
-    pub fn confirm(&self) {
-        if let Ok(file) = fs::File::options().append(true).open(&self.path) {
-            let _ = file.set_modified(SystemTime::now());
-        }
+    /// Whether this snapshot is recent enough for `--max-age` to start from.
+    pub fn young(&self, max_age: Duration) -> bool {
+        SystemTime::now()
+            .duration_since(self.confirmed)
+            .is_ok_and(|age| age <= max_age)
     }
 
     /// The listings a walk may reuse, by directory identity.
@@ -215,6 +225,13 @@ impl Previous {
     }
 }
 
+/// Mark the snapshot at `path` as confirmed now, without rewriting it.
+pub fn confirm(path: &Path) {
+    if let Ok(file) = fs::File::options().append(true).open(path) {
+        let _ = file.set_modified(SystemTime::now());
+    }
+}
+
 /// Whether a walk found exactly what `snapshot` holds, in which case the
 /// snapshot only needs to be marked as confirmed.
 pub fn same(snapshot: &Snapshot, root: &Root) -> bool {
@@ -254,6 +271,7 @@ pub fn save(
     options: &Options,
     root: &Root,
     taken: Time,
+    journal: Option<Position>,
 ) -> std::io::Result<()> {
     let (Ok(meta), Some(slot)) = (root.meta, &root.dir) else {
         return Ok(());
@@ -265,6 +283,14 @@ pub fn save(
     let mut out = Vec::with_capacity(1 << 16);
     out.extend_from_slice(MAGIC);
     put_time(&mut out, taken);
+    match journal {
+        None => out.push(0),
+        Some((uuid, event)) => {
+            out.push(1);
+            out.extend_from_slice(&uuid);
+            put_u64(&mut out, event);
+        }
+    }
     put_meta(&mut out, &meta, OWN_DEV | OWN_CTIME);
     put_listing(&mut out, listing, meta.dev);
     let path = Snapshot::file(dir, options, &meta);
@@ -563,11 +589,7 @@ impl Reader<'_> {
                 dir,
             });
         }
-        Some(Listing {
-            entries,
-            error,
-            reused: false,
-        })
+        Some(Listing { entries, error })
     }
 }
 
@@ -650,6 +672,7 @@ mod tests {
         let snapshot = Snapshot {
             path: PathBuf::new(),
             taken: Time { sec: 1000, nsec: 0 },
+            journal: None,
             confirmed: SystemTime::now(),
             root: meta(1, 10),
             tree,

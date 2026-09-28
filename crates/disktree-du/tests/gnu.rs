@@ -309,27 +309,76 @@ fn json_describes_what_du_prints() {
     );
 }
 
-#[test]
-fn max_age_answers_from_the_index_and_says_so() {
+/// Set a file's modification time `seconds` into the past.
+fn age(path: &Path, seconds: u64) {
+    let when = std::time::SystemTime::now() - std::time::Duration::from_secs(seconds);
+    std::fs::File::options()
+        .append(true)
+        .open(path)
+        .and_then(|file| file.set_modified(when))
+        .expect("set mtime");
+}
+
+fn source_of(output: &Output) -> String {
+    let text = String::from_utf8_lossy(&output.stdout);
+    let at = text.find("\"source\": \"").expect("a source") + 11;
+    text[at..].split('"').next().unwrap_or_default().to_owned()
+}
+
+/// `--max-age` catches up on what changed since the snapshot and answers
+/// what a walk would, without walking.
+fn catches_up(journal: bool) {
     let temp = tempfile::TempDir::new().expect("tempdir");
-    let root = temp.path();
-    write(&root.join("d/f"), 10_000);
+    let root = temp.path().canonicalize().expect("canonical");
+    for dir in ["a/b/c", "a/d", "e"] {
+        write(&root.join(dir).join("old"), 20_000);
+        age(&root.join(dir).join("old"), 7200);
+    }
+    write(&root.join("e/gone"), 9000);
     let index = root.join("index");
     let du = Path::new(env!("CARGO_BIN_EXE_disktree-du"));
-    let env = [("DISKTREE_DU_INDEX_DIR", index.as_path())];
-    let first = run(du, root, &["-s", "d"], &env);
-    // A file grows; its directory's timestamps do not move.
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(root.join("d/f"))
-        .and_then(|mut f| std::io::Write::write_all(&mut f, &vec![0; 100_000]))
-        .expect("grow");
-    let trusted = run(du, root, &["-s", "--max-age=1h", "--json", "d"], &env);
-    let text = String::from_utf8_lossy(&trusted.stdout);
-    assert!(text.contains("\"source\": \"index\""), "{text}");
-    let exact = run(du, root, &["-s", "d"], &env);
-    assert_ne!(
-        first.stdout, exact.stdout,
-        "without --max-age the growth is seen"
+    let off = Path::new("0");
+    let mut env = vec![("DISKTREE_DU_INDEX_DIR", index.as_path())];
+    if !journal {
+        env.push(("DISKTREE_DU_JOURNAL", off));
+    }
+    let args = ["-a", "a", "e"];
+    run(du, &root, &args, &env);
+
+    // A new file deep down, one removed, and an old file grown in place,
+    // which leaves every directory's timestamps alone.
+    write(&root.join("a/b/c/new"), 50_000);
+    std::fs::remove_file(root.join("e/gone")).expect("remove");
+    if journal {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(root.join("a/d/old"))
+            .and_then(|mut f| std::io::Write::write_all(&mut f, &vec![1; 300_000]))
+            .expect("grow");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let hour = Path::new("1h");
+    let mut cached_env = env.clone();
+    cached_env.push(("DISKTREE_DU_MAX_AGE", hour));
+    let cached = run(du, &root, &[&args[..], &["--json"]].concat(), &cached_env);
+    let want = if journal { "journal" } else { "directories" };
+    assert_eq!(source_of(&cached), want, "{}", show(&cached));
+    let cached = run(du, &root, &args, &cached_env);
+    let walked = run(du, &root, &args, &[("DISKTREE_DU_INDEX", off)]);
+    assert_eq!(
+        String::from_utf8_lossy(&cached.stdout),
+        String::from_utf8_lossy(&walked.stdout)
     );
+}
+
+#[test]
+fn max_age_catches_up_by_directory() {
+    catches_up(false);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn max_age_catches_up_through_the_journal() {
+    catches_up(true);
 }

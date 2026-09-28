@@ -107,7 +107,7 @@ pub enum StatError {
 
 pub type Slot = OnceLock<Listing>;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Entry {
     pub name: Box<[u8]>,
     pub d_ino: u64,
@@ -128,8 +128,6 @@ pub enum ListError {
 pub struct Listing {
     pub entries: Vec<Entry>,
     pub error: Option<ListError>,
-    /// Whether this listing came from the index instead of `readdir`.
-    pub reused: bool,
 }
 
 #[derive(Debug)]
@@ -137,6 +135,12 @@ pub struct Root {
     pub path: Vec<u8>,
     pub meta: Result<Meta, StatError>,
     pub dir: Option<Arc<Slot>>,
+}
+
+/// A byte string as a path; on Unix any byte string is one.
+pub fn bytes_path(bytes: &[u8]) -> &std::path::Path {
+    use std::os::unix::ffi::OsStrExt as _;
+    std::path::Path::new(std::ffi::OsStr::from_bytes(bytes))
 }
 
 /// `fts_open` trims a run of trailing slashes on an operand to one, but
@@ -292,6 +296,46 @@ impl<'a> Walker<'a> {
         });
     }
 
+    /// Whether the walk goes into `child`, the entry at `path`: a
+    /// directory, on the operand's device under `-x`, and not excluded.
+    /// With `-L` an excluded directory is still walked, because its listing
+    /// may be shared with a path that is not excluded.
+    pub fn enters(&self, path: &[u8], child: &Meta, root_dev: u64) -> bool {
+        child.is_dir()
+            && !(self.one_file_system && child.dev != root_dev)
+            && !(self.deref != Deref::All
+                && !self.excludes.is_empty()
+                && self.excludes.excludes(path))
+    }
+
+    /// Walk one directory below an operand from scratch.
+    pub fn walk_dir(
+        &self,
+        path: &[u8],
+        meta: Meta,
+        root_dev: u64,
+    ) -> Arc<Slot> {
+        let slot = Arc::new(Slot::new());
+        let context = Context {
+            root_dev,
+            previous: None,
+        };
+        rayon::scope(|scope| {
+            self.list(scope, &context, path, meta, false, &slot);
+        });
+        slot
+    }
+
+    /// One directory's entries and their stats, read afresh.
+    pub fn read_fresh(
+        &self,
+        path: &[u8],
+        meta: Meta,
+        is_root: bool,
+    ) -> Listing {
+        self.read(path, meta, is_root, None)
+    }
+
     fn list<'s>(
         &'s self,
         scope: &rayon::Scope<'s>,
@@ -306,17 +350,8 @@ impl<'a> Walker<'a> {
         let mut listing = listing;
         for entry in &mut listing.entries {
             let Ok(child) = entry.meta else { continue };
-            if !child.is_dir() {
-                continue;
-            }
-            if self.one_file_system && child.dev != root_dev {
-                continue;
-            }
             let child_path = join(path, &entry.name);
-            if self.deref != Deref::All
-                && !self.excludes.is_empty()
-                && self.excludes.excludes(&child_path)
-            {
+            if !self.enters(&child_path, &child, root_dev) {
                 continue;
             }
             let child_slot = if self.deref == Deref::All {
@@ -405,7 +440,6 @@ impl<'a> Walker<'a> {
             return Listing {
                 entries: stat_missing(fd.as_fd(), items),
                 error,
-                reused: false,
             };
         }
         if let Some(names) = previous.and_then(|previous| previous.names(meta))
@@ -413,7 +447,6 @@ impl<'a> Walker<'a> {
             return Listing {
                 entries: stat_all(fd.as_fd(), names, follow),
                 error: None,
-                reused: true,
             };
         }
         let sort = inode_sort_useful(fd.as_fd());
@@ -462,11 +495,7 @@ impl<'a> Walker<'a> {
                 Vec::new()
             }
         };
-        Listing {
-            entries,
-            error,
-            reused: false,
-        }
+        Listing { entries, error }
     }
 }
 

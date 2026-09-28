@@ -196,13 +196,12 @@ impl Json {
         self,
         as_of: std::time::SystemTime,
         source: &str,
-        reused: usize,
     ) -> std::io::Result<()> {
         let as_of: DateTime<Local> = as_of.into();
         let mut out = String::from("{\n");
         let _ = write!(
             out,
-            "  \"as_of\": {},\n  \"source\": {},\n  \"reused_listings\": {reused},\n",
+            "  \"as_of\": {},\n  \"source\": {},\n",
             json_string(&as_of.to_rfc3339()),
             json_string(source)
         );

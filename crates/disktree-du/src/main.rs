@@ -11,10 +11,14 @@ mod quote;
 
 #[cfg(target_os = "macos")]
 mod bulk;
+#[cfg(target_os = "macos")]
+mod fsevents;
 #[cfg(unix)]
 mod index;
 #[cfg(unix)]
 mod output;
+#[cfg(unix)]
+mod refresh;
 #[cfg(unix)]
 mod report;
 #[cfg(unix)]
@@ -53,13 +57,85 @@ fn main() -> ExitCode {
     }
 }
 
+/// How an operand's numbers were arrived at.
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// A walk of the whole operand.
+    Walk,
+    /// A snapshot, caught up through the change journal.
+    Journal,
+    /// A snapshot, caught up by statting every directory.
+    Directories,
+}
+
+#[cfg(unix)]
+impl Source {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Walk => "walk",
+            Self::Journal => "journal",
+            Self::Directories => "directories",
+        }
+    }
+}
+
 /// One operand, ready to report: its walk, and the snapshot that helped.
 #[cfg(unix)]
 struct Prepared {
     root: Option<walk::Root>,
-    snapshot: Option<index::Snapshot>,
-    /// When the index answered for this operand, as of when.
-    from_index: Option<std::time::SystemTime>,
+    /// The snapshot file this answer started from, if any.
+    snapshot: Option<std::path::PathBuf>,
+    source: Source,
+    /// Whether the answer differs from the snapshot it started from, and
+    /// so has to be written back rather than just marked as confirmed.
+    changed: bool,
+    /// The change journal's position from before this operand was looked
+    /// at, for the next catch-up to start from.
+    journal: Option<index::Position>,
+}
+
+/// Where the change journal of `root`'s volume stands, if it keeps one.
+#[cfg(unix)]
+fn journal_position(root: &walk::Root) -> Option<index::Position> {
+    #[cfg(target_os = "macos")]
+    if let Ok(meta) = root.meta {
+        let uuid = fsevents::volume_uuid(meta.dev)?;
+        return Some((uuid, fsevents::current_event()));
+    }
+    let _ = root;
+    None
+}
+
+/// What the journal recorded under `root` since `snapshot`, when it can
+/// vouch for the whole interval.
+#[cfg(unix)]
+fn replay(
+    snapshot: &index::Snapshot,
+    root: &walk::Root,
+    now: Option<index::Position>,
+) -> Option<refresh::Journal> {
+    #[cfg(target_os = "macos")]
+    {
+        // An escape hatch, and how the tests reach the other path.
+        if std::env::var_os("DISKTREE_DU_JOURNAL").is_some_and(|v| v == "0") {
+            return None;
+        }
+        let ((then_uuid, since), (now_uuid, _)) = (snapshot.journal?, now?);
+        if then_uuid != now_uuid {
+            return None;
+        }
+        let path = walk::bytes_path(&root.path);
+        let base = std::fs::canonicalize(path).ok()?;
+        let base = base.as_os_str().as_encoded_bytes();
+        let changes = fsevents::changes_since(base, since)?;
+        Some(refresh::Journal::new(base, &changes))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (snapshot, root, now);
+        None
+    }
 }
 
 #[cfg(unix)]
@@ -73,12 +149,17 @@ fn prepare(
         return Prepared {
             root: None,
             snapshot: None,
-            from_index: None,
+            source: Source::Walk,
+            changed: false,
+            journal: None,
         };
     };
     let mut root = walker.root(path);
-    // The snapshot is read only when it can help: to answer for `--max-age`,
-    // or where the walk can reuse its listings.
+    // Taken before anything is read, so the next catch-up replays whatever
+    // changes while this one runs.
+    let journal = journal_position(&root);
+    // The snapshot is read only when it can help: to catch up from for
+    // `--max-age`, or where the walk can reuse its listings.
     let wanted = options.max_age.is_some() || walker.reuses_listings();
     let snapshot = match (index_dir, root.meta) {
         (Some(dir), Ok(meta)) if wanted && walker.descends(&root) => {
@@ -86,18 +167,32 @@ fn prepare(
         }
         _ => None,
     };
-    if let (Some(snapshot), Some(max_age), Ok(meta)) =
-        (&snapshot, options.max_age, root.meta)
+    if let (Some(snapshot), Some(max_age)) = (&snapshot, options.max_age)
         && !options.fresh
         // The index keeps no access times to answer `--time=atime` with.
         && !matches!(options.time, Some((args::TimeKind::Accessed, _)))
-        && snapshot.trusted(max_age, &meta)
+        && snapshot.young(max_age)
     {
-        root.dir = Some(std::sync::Arc::clone(&snapshot.tree));
+        let mut changes = replay(snapshot, &root, journal);
+        let source = if changes.is_some() {
+            Source::Journal
+        } else {
+            Source::Directories
+        };
+        let changed = refresh::refresh(
+            walker,
+            &mut root,
+            &snapshot.tree,
+            &snapshot.root,
+            snapshot.taken,
+            changes.as_mut(),
+        );
         return Prepared {
             root: Some(root),
-            snapshot: None,
-            from_index: Some(snapshot.confirmed),
+            snapshot: Some(snapshot.path().to_owned()),
+            source,
+            changed,
+            journal,
         };
     }
     let previous = snapshot
@@ -105,10 +200,15 @@ fn prepare(
         .filter(|_| !options.fresh)
         .map(index::Snapshot::previous);
     walker.fill(&mut root, previous.as_ref());
+    let changed = snapshot
+        .as_ref()
+        .is_none_or(|snapshot| options.fresh || !index::same(snapshot, &root));
     Prepared {
         root: Some(root),
-        snapshot,
-        from_index: None,
+        snapshot: snapshot.map(|snapshot| snapshot.path().to_owned()),
+        source: Source::Walk,
+        changed,
+        journal,
     }
 }
 
@@ -134,23 +234,17 @@ fn run(program: &str, options: &args::Options) -> ExitCode {
         .par_iter()
         .map(|operand| prepare(options, &walker, index_dir.as_deref(), operand))
         .collect();
+
     // The index is written while the answer is printed; it is a cache, so
     // failing to write it is not du's failure.
     let save = || {
         let Some(dir) = &index_dir else { return };
         prepared.par_iter().for_each(|p| {
-            let Some(root) = p.root.as_ref().filter(|_| p.from_index.is_none())
-            else {
-                return;
-            };
+            let Some(root) = &p.root else { return };
             match &p.snapshot {
-                Some(snapshot)
-                    if !options.fresh && index::same(snapshot, root) =>
-                {
-                    snapshot.confirm();
-                }
+                Some(snapshot) if !p.changed => index::confirm(snapshot),
                 _ => {
-                    let _ = index::save(dir, options, root, started);
+                    let _ = index::save(dir, options, root, started, p.journal);
                 }
             }
         });
@@ -178,14 +272,8 @@ fn answer(
     if options.json {
         let sink = output::Json::new(options.units, options.inodes);
         let (ok, sink) = report_all(program, options, &roots, sink);
-        let (as_of, source) = provenance(prepared, started);
-        let reused = prepared
-            .iter()
-            .filter(|p| p.from_index.is_none())
-            .filter_map(|p| p.root.as_ref())
-            .map(reused_listings)
-            .sum();
-        sink.write(as_of, source, reused).ok()?;
+        sink.write(index::system_time(started), source(prepared))
+            .ok()?;
         Some(ok)
     } else {
         let time_format =
@@ -202,42 +290,21 @@ fn answer(
     }
 }
 
-/// When the numbers were true, and where they came from, for `--json`.
-/// Answers from the index are as old as the oldest snapshot used.
+/// How the numbers were arrived at, for `--json`: one source, or "mixed".
 #[cfg(unix)]
-fn provenance(
-    prepared: &[Prepared],
-    started: walk::Time,
-) -> (std::time::SystemTime, &'static str) {
-    let walked = prepared
+fn source(prepared: &[Prepared]) -> &'static str {
+    let mut sources = prepared
         .iter()
-        .any(|p| p.from_index.is_none() && p.root.is_some());
-    match prepared.iter().filter_map(|p| p.from_index).min() {
-        None => (index::system_time(started), "walk"),
-        Some(oldest) => (oldest, if walked { "mixed" } else { "index" }),
+        .filter(|p| p.root.is_some())
+        .map(|p| p.source);
+    let Some(first) = sources.next() else {
+        return Source::Walk.label();
+    };
+    if sources.all(|source| source == first) {
+        first.label()
+    } else {
+        "mixed"
     }
-}
-
-#[cfg(unix)]
-fn reused_listings(root: &walk::Root) -> usize {
-    let mut count = 0;
-    let mut stack: Vec<&walk::Listing> = root
-        .dir
-        .as_deref()
-        .and_then(std::sync::OnceLock::get)
-        .into_iter()
-        .collect();
-    while let Some(listing) = stack.pop() {
-        count += usize::from(listing.reused);
-        stack.extend(
-            listing
-                .entries
-                .iter()
-                .filter_map(|entry| entry.dir.as_deref())
-                .filter_map(std::sync::OnceLock::get),
-        );
-    }
-    count
 }
 
 #[cfg(unix)]
