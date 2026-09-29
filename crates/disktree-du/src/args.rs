@@ -303,9 +303,10 @@ fn scan(args: &[OsString]) -> (Vec<Item>, Vec<Vec<u8>>) {
                             .iter()
                             .map(|(long, ..)| format!("'--{long}'"))
                             .collect();
+                        // glibc repeats the option as given, `=value` too.
                         given.push(Item::Complaint(format!(
                             "option '--{}' is ambiguous; possibilities: {}",
-                            String::from_utf8_lossy(name),
+                            String::from_utf8_lossy(body),
                             list.join(" ")
                         )));
                         continue;
@@ -545,7 +546,7 @@ pub fn parse(program: &Program, args: &[OsString]) -> Parsed {
             Opt::Short(b'L') => options.deref = Deref::All,
             Opt::Short(b'P') => options.deref = Deref::Physical,
             Opt::Short(b'S') => options.separate_dirs = true,
-            Opt::Short(b'X') => match std::fs::read(bytes_path(arg)) {
+            Opt::Short(b'X') => match read_all(arg) {
                 Ok(contents) => options.excludes.add_file(&contents),
                 Err(error) => parser.fail(&format!(
                     "{}: {}",
@@ -642,24 +643,25 @@ pub fn parse(program: &Program, args: &[OsString]) -> Parsed {
             parser.try_help();
             return Parsed::Exit(1);
         }
-        let contents = if from == b"-" {
-            let mut buffer = Vec::new();
-            std::io::Read::read_to_end(&mut std::io::stdin(), &mut buffer)
-                .map(|_| buffer)
+        // Failing to open the list ends du; failing to read it part way is
+        // reported where it happens, and the total is still printed.
+        let mut source: Box<dyn std::io::Read> = if from == b"-" {
+            Box::new(std::io::stdin())
         } else {
-            std::fs::read(bytes_path(&from))
-        };
-        let contents = match contents {
-            Ok(contents) => contents,
-            Err(error) => {
-                parser.error(&format!(
-                    "cannot open {} for reading: {}",
-                    quote::always(&from),
-                    crate::strerror(&error)
-                ));
-                return Parsed::Exit(1);
+            match std::fs::File::open(bytes_path(&from)) {
+                Ok(file) => Box::new(file),
+                Err(error) => {
+                    parser.error(&format!(
+                        "cannot open {} for reading: {}",
+                        quote::always(&from),
+                        crate::strerror(&error)
+                    ));
+                    return Parsed::Exit(1);
+                }
             }
         };
+        let mut contents = Vec::new();
+        let read_error = source.read_to_end(&mut contents).err();
         let mut names: Vec<&[u8]> = contents.split(|&b| b == 0).collect();
         if names.last().is_some_and(|name| name.is_empty()) {
             names.pop();
@@ -682,6 +684,13 @@ pub fn parse(program: &Program, args: &[OsString]) -> Parsed {
             };
             options.operands.push(operand);
         }
+        if let Some(error) = read_error {
+            options.operands.push(Operand::Invalid(format!(
+                "{}: read error: {}",
+                quote::when_needed(&from),
+                crate::strerror(&error)
+            )));
+        }
         options.hash_all = true;
     } else {
         options.hash_all = operands.len() > 1 || options.deref == Deref::All;
@@ -697,6 +706,17 @@ pub fn parse(program: &Program, args: &[OsString]) -> Parsed {
         }
     }
     Parsed::Run(Box::new(options))
+}
+
+/// A file's contents, or standard input's for `-`.
+fn read_all(name: &[u8]) -> std::io::Result<Vec<u8>> {
+    if name == b"-" {
+        let mut buffer = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin(), &mut buffer)?;
+        Ok(buffer)
+    } else {
+        std::fs::read(bytes_path(name))
+    }
 }
 
 fn bytes_path(bytes: &[u8]) -> std::path::PathBuf {

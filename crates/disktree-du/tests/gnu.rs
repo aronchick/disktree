@@ -11,6 +11,8 @@ use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use rustix::fs::{Mode, OFlags, mkdirat, openat};
+
 /// The coreutils release disktree-du follows. Older ones differ in a few
 /// places, listed in [`CHANGED_SINCE`].
 const FOLLOWS: (u32, u32) = (9, 11);
@@ -106,6 +108,29 @@ fn fixture(root: &Path) {
     // A subdirectory among them, so the order of directories shows.
     write(&many.join("zz-sub/inner"), 3000);
     write(&many.join("aa-sub/inner"), 3000);
+
+    // Deeper than PATH_MAX (1024 bytes on macOS) from the root, built a
+    // level at a time since no single path can reach the bottom.
+    let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY;
+    std::fs::create_dir(root.join("deep")).expect("mkdir");
+    let mut at =
+        openat(rustix::fs::CWD, root.join("deep"), dir_flags, Mode::empty())
+            .expect("open");
+    for level in 0..6 {
+        let name = format!("{level}{}", "d".repeat(200));
+        mkdirat(&at, name.as_str(), Mode::from_raw_mode(0o755))
+            .expect("mkdirat");
+        at = openat(&at, name.as_str(), dir_flags, Mode::empty())
+            .expect("openat");
+    }
+    let file = openat(
+        &at,
+        "bottom",
+        OFlags::WRONLY | OFlags::CREATE,
+        Mode::from_raw_mode(0o644),
+    )
+    .expect("create");
+    rustix::io::write(&file, &[b'x'; 5000]).expect("write");
 }
 
 struct Harness {
@@ -232,6 +257,12 @@ fn matches_gnu_du() {
     write(&locked.join("secret"), 100);
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
         .expect("chmod");
+    // Readable but not searchable: its names can be listed, not stat'ed.
+    let listed = tree.join("listed");
+    write(&listed.join("one"), 100);
+    write(&listed.join("two"), 100);
+    std::fs::set_permissions(&listed, std::fs::Permissions::from_mode(0o644))
+        .expect("chmod");
 
     // Named as GNU's binary is, so both prefix diagnostics the same way.
     let bin = base.join("bin");
@@ -246,7 +277,7 @@ fn matches_gnu_du() {
     };
 
     let exclude_file = base.join("excludes");
-    std::fs::write(&exclude_file, "*.gz\nmid\n").expect("write");
+    std::fs::write(&exclude_file, "*.gz  \r\n\n\nmid\n").expect("write");
     let exclude_from = format!("--exclude-from={}", exclude_file.display());
     let names0 = base.join("names0");
     std::fs::write(&names0, b"a\0big\0\0links\0").expect("write");
@@ -325,6 +356,12 @@ fn matches_gnu_du() {
         &["--max-d=1", "--sum"],
         &["--", "-a"],
         &["a", "-s"],
+        &["--files0-from=a", "-c"],
+        &["--s=1"],
+        &["-a", "listed"],
+        &["-s", "deep"],
+        &["-a", "--exclude=./a/b", "./a"],
+        &["-a", "--exclude=./a/b", "a"],
     ];
     let failures: Vec<String> = cases
         .iter()
@@ -333,6 +370,8 @@ fn matches_gnu_du() {
         .collect();
 
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod");
+    std::fs::set_permissions(&listed, std::fs::Permissions::from_mode(0o755))
         .expect("chmod");
     assert!(
         failures.is_empty(),

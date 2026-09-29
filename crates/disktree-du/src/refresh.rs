@@ -23,10 +23,9 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustix::fs::CWD;
 
 use crate::walk::{
-    Entry, Listing, Meta, Root, Slot, Time, Walker, join, stat_at,
+    Entry, Listing, Meta, Root, Slot, Time, Walker, join, stat_path,
 };
 
 /// How recently before a snapshot a file must have been written for it to
@@ -76,9 +75,21 @@ impl Journal {
             journal.touch(&dir);
             journal.dirs.insert(dir);
         }
-        for dir in changes.subtrees.iter().filter_map(|dir| relative(dir)) {
-            journal.touch(&dir);
-            journal.subtrees.push(dir);
+        for dir in &changes.subtrees {
+            // A subtree at or above the operand covers all of it.
+            let covers = base.starts_with(dir)
+                && (dir.ends_with(b"/")
+                    || base.len() == dir.len()
+                    || base.get(dir.len()) == Some(&b'/'));
+            let rel = if covers {
+                Some(Vec::new())
+            } else {
+                relative(dir)
+            };
+            if let Some(rel) = rel {
+                journal.touch(&rel);
+                journal.subtrees.push(rel);
+            }
         }
         journal
     }
@@ -131,16 +142,28 @@ fn child_rel(rel: &[u8], name: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Unchanged as far as its entries go.
-fn same_dir(then: &Meta, now: &Meta) -> bool {
+/// Unchanged as far as its entries go. A directory whose timestamps were
+/// within [`RACY_SECS`] of the snapshot's walk could have changed again in
+/// the same tick after it was read, so it counts as changed: the index's
+/// racy-clean rule.
+fn same_dir(then: &Meta, now: &Meta, taken: Time) -> bool {
+    let limit = Time {
+        sec: taken.sec.saturating_sub(RACY_SECS),
+        nsec: taken.nsec,
+    };
     then.key() == now.key()
         && then.ctime == now.ctime
         && then.mtime == now.mtime
+        && then.ctime < limit
+        && then.mtime < limit
 }
+
+const RACY_SECS: i64 = 2;
 
 struct Refresher<'a> {
     walker: &'a Walker<'a>,
     root_dev: u64,
+    taken: Time,
     recent: Time,
     journal: Option<&'a Journal>,
 }
@@ -164,12 +187,13 @@ pub fn refresh(
     // With a journal, the directories holding files to stat again have to
     // be visited too; find them in the snapshot.
     let journal = journal.map(|journal| {
-        mark_rechecks(tree, b"", recent, journal);
+        mark_rechecks(tree, b"", recent, now.dev, journal);
         &*journal
     });
     let refresher = Refresher {
         walker,
         root_dev: now.dev,
+        taken,
         recent,
         journal,
     };
@@ -179,18 +203,27 @@ pub fn refresh(
     changed || !then.unchanged(&now)
 }
 
-fn mark_rechecks(slot: &Slot, rel: &[u8], recent: Time, journal: &mut Journal) {
+/// Mark the directories a journal catch-up has to visit although the
+/// journal does not name them: those holding files to stat again, and
+/// those on another file system, whose changes are in another journal.
+fn mark_rechecks(
+    slot: &Slot,
+    rel: &[u8],
+    recent: Time,
+    dev: u64,
+    journal: &mut Journal,
+) {
     let Some(listing) = slot.get() else { return };
     let mut here = false;
     for entry in &listing.entries {
         match (&entry.meta, &entry.dir) {
             (Ok(meta), Some(dir)) if meta.is_dir() => {
-                mark_rechecks(
-                    dir,
-                    &child_rel(rel, &entry.name),
-                    recent,
-                    journal,
-                );
+                let child = child_rel(rel, &entry.name);
+                if meta.dev == dev {
+                    mark_rechecks(dir, &child, recent, dev, journal);
+                } else {
+                    journal.touch(&child);
+                }
             }
             (Ok(meta), _) => here |= recheck(meta, recent),
             (Err(_), _) => {}
@@ -218,8 +251,9 @@ impl Refresher<'_> {
             return (self.walker.walk_dir(path, now, self.root_dev), true);
         };
         let dirty = match self.journal {
-            Some(journal) => journal.dirty(rel),
-            None => !same_dir(then, &now),
+            // Another file system's changes are in another journal.
+            Some(journal) => journal.dirty(rel) || now.dev != self.root_dev,
+            None => !same_dir(then, &now, self.taken),
         } || old_listing.error.is_some();
         if dirty {
             return (self.reread(path, rel, old_listing, now, is_root), true);
@@ -252,7 +286,7 @@ impl Refresher<'_> {
             if !recheck(&then, self.recent) {
                 return (entry.clone(), false);
             }
-            let now = stat_at(CWD, &entry_path, false);
+            let now = stat_path(&entry_path, false);
             let changed = !matches!(now, Ok(now) if now.unchanged(&then));
             return (
                 Entry {
@@ -269,7 +303,7 @@ impl Refresher<'_> {
         if self.journal.is_some_and(|journal| !journal.visit(&rel)) {
             return (entry.clone(), false);
         }
-        let now = stat_at(CWD, &entry_path, false);
+        let now = stat_path(&entry_path, false);
         let (dir, changed) = match now {
             Ok(now) if now.is_dir() && now.key() == then.key() => {
                 let (dir, changed) =
@@ -340,4 +374,65 @@ fn slot(listing: Listing) -> Arc<Slot> {
     let slot = Arc::new(Slot::new());
     let _ = slot.set(listing);
     slot
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir(sec: i64) -> Meta {
+        let time = Time { sec, nsec: 0 };
+        Meta {
+            dev: 1,
+            ino: 2,
+            mode: 0o040_755,
+            nlink: 2,
+            blocks: 0,
+            size: 64,
+            mtime: time,
+            atime: time,
+            ctime: time,
+        }
+    }
+
+    #[test]
+    fn a_journal_catch_up_visits_other_file_systems() {
+        let mut mounted = dir(50);
+        mounted.dev = 9;
+        let tree = slot(Listing {
+            entries: vec![
+                Entry {
+                    name: b"same".as_slice().into(),
+                    d_ino: 2,
+                    meta: Ok(dir(50)),
+                    dir: Some(slot(Listing::default())),
+                },
+                Entry {
+                    name: b"mount".as_slice().into(),
+                    d_ino: 3,
+                    meta: Ok(mounted),
+                    dir: Some(slot(Listing::default())),
+                },
+            ],
+            error: None,
+        });
+        let mut journal = Journal::default();
+        mark_rechecks(&tree, b"", Time { sec: 0, nsec: 0 }, 1, &mut journal);
+        assert!(
+            journal.visit(b"mount"),
+            "its changes are not in this journal"
+        );
+        assert!(!journal.visit(b"same"));
+    }
+
+    #[test]
+    fn a_directory_changed_near_the_walk_counts_as_changed() {
+        let taken = Time { sec: 100, nsec: 0 };
+        assert!(same_dir(&dir(50), &dir(50), taken));
+        assert!(!same_dir(&dir(50), &dir(51), taken), "timestamps moved");
+        assert!(
+            !same_dir(&dir(99), &dir(99), taken),
+            "within the racy window"
+        );
+    }
 }

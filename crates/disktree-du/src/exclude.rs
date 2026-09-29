@@ -16,16 +16,18 @@ impl Excludes {
         self.patterns.push(pattern.to_vec());
     }
 
-    /// Patterns from a file, one per line, as `-X` reads them.
+    /// Patterns from a file, one per line, as `-X` reads them: gnulib's
+    /// `add_exclude_fp` drops trailing white space, a `\r` included, and
+    /// skips lines left empty.
     pub fn add_file(&mut self, contents: &[u8]) {
-        let mut lines: Vec<&[u8]> = contents.split(|&b| b == b'\n').collect();
-        // The split leaves an empty piece after a final newline; gnulib
-        // stops at the end of the buffer instead.
-        if lines.last().is_some_and(|line| line.is_empty()) {
-            lines.pop();
-        }
-        for line in lines {
-            self.add(line);
+        for line in contents.split(|&b| b == b'\n') {
+            let end = line
+                .iter()
+                .rposition(|&b| !(b.is_ascii_whitespace() || b == 0x0b))
+                .map_or(0, |at| at + 1);
+            if end > 0 {
+                self.add(&line[..end]);
+            }
         }
     }
 

@@ -409,7 +409,24 @@ in the journal until it is closed, so files modified within an hour of the
 snapshot are stat'ed again every time, which covers the usual case, a log or
 a build still being written. And by directory, a file that grew in place
 without its directory changing is only caught if it was one of those recent
-files. `--fresh` walks everything again.
+files. Either way `AGE` counts from the last full walk, and a catch-up does
+not reset it, so nothing can go unseen for longer than `AGE`. `--fresh` walks
+everything again.
+
+Known differences from GNU du, all rare:
+
+- `du >&-` exits 0: Rust reopens a closed standard output on `/dev/null`
+  before `du` starts, so the write error GNU reports never happens.
+- Hard links to one file in the same directory of more than 10,000 entries
+  can be listed in another order, since GNU sorts those with the C library's
+  unstable `qsort`.
+- Numbers use the C locale's `.` and no digit grouping, and `--time` formats
+  go through chrono rather than the C library's `strftime`: `full-iso`,
+  `long-iso` and `iso` match, but `%Z` prints an offset and `%x` a two-digit
+  year.
+- In a UTF-8 locale, `--exclude` wildcards match bytes rather than
+  characters, and diagnostics do not escape control characters inside
+  `‘...’` quotes.
 
 `--json` prints the same entries as one document, each with its size, its
 kind, why it can be had back, the command that gives the space back (`cargo

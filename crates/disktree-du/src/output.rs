@@ -61,20 +61,31 @@ pub fn format_time(time: Time, format: &str) -> String {
     out
 }
 
+/// Standard output failed: end as GNU du does. A reader that went away
+/// (`| head`) would have killed it with SIGPIPE, which a shell reports as
+/// 141; anything else is "write error" and status 1. The index being written
+/// alongside is a cache and can be abandoned.
+pub fn write_failed(program: &str, error: &std::io::Error) -> ! {
+    if error.kind() == std::io::ErrorKind::BrokenPipe {
+        std::process::exit(141);
+    }
+    eprintln!("{program}: write error: {}", crate::strerror(error));
+    std::process::exit(1);
+}
+
 /// GNU's output, line by line.
 pub struct Text {
     out: BufWriter<Stdout>,
+    program: String,
     units: Units,
     inodes: bool,
     time_format: Option<String>,
     terminator: u8,
-    /// Set once standard output is gone (a closed pipe), after which there
-    /// is nothing left to print to.
-    broken: bool,
 }
 
 impl Text {
     pub fn new(
+        program: &str,
         units: Units,
         inodes: bool,
         time_format: Option<String>,
@@ -82,18 +93,15 @@ impl Text {
     ) -> Self {
         Self {
             out: BufWriter::with_capacity(64 * 1024, std::io::stdout()),
+            program: program.to_owned(),
             units,
             inodes,
             time_format,
             terminator: if null { 0 } else { b'\n' },
-            broken: false,
         }
     }
 
     fn write(&mut self, dui: &Dui, path: &[u8]) {
-        if self.broken {
-            return;
-        }
         let value = if self.inodes { dui.inodes } else { dui.size };
         let mut line = human_readable(value, self.units).into_bytes();
         if let Some(format) = &self.time_format {
@@ -107,13 +115,9 @@ impl Text {
         line.push(b'\t');
         line.extend_from_slice(path);
         line.push(self.terminator);
-        if self.out.write_all(&line).is_err() {
-            self.broken = true;
+        if let Err(error) = self.out.write_all(&line) {
+            write_failed(&self.program, &error);
         }
-    }
-
-    pub const fn is_broken(&self) -> bool {
-        self.broken
     }
 }
 
@@ -127,8 +131,8 @@ impl Sink for Text {
     }
 
     fn flush(&mut self) {
-        if !self.broken && self.out.flush().is_err() {
-            self.broken = true;
+        if let Err(error) = self.out.flush() {
+            write_failed(&self.program, &error);
         }
     }
 }

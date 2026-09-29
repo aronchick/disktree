@@ -104,6 +104,13 @@ pub fn read(dir: BorrowedFd<'_>) -> Option<(Vec<Item>, Option<Errno>)> {
                 return Some((items, None));
             }
             let Ok(count) = usize::try_from(count) else {
+                // Failing before the first entry, as on a directory that
+                // can be read but not searched, or a file system without
+                // the call, leaves the listing to `readdir`, which reports
+                // what GNU does.
+                if items.is_empty() {
+                    return None;
+                }
                 let error = std::io::Error::last_os_error();
                 let errno = error.raw_os_error().unwrap_or(libc::EIO);
                 return Some((items, Some(Errno::from_raw_os_error(errno))));

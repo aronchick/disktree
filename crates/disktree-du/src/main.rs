@@ -59,7 +59,16 @@ fn main() -> ExitCode {
         args::Parsed::Exit(code) => {
             ExitCode::from(u8::try_from(code).unwrap_or(1))
         }
-        args::Parsed::Run(options) => run(&program.short, &options),
+        args::Parsed::Run(options) => {
+            // Deep trees recurse deeply, in the report and the catch-up;
+            // give every thread room for the deepest path a system allows.
+            let pool =
+                rayon::ThreadPoolBuilder::new().stack_size(64 << 20).build();
+            match pool {
+                Ok(pool) => pool.install(|| run(&program.short, &options)),
+                Err(_) => run(&program.short, &options),
+            }
+        }
     }
 }
 
@@ -90,12 +99,10 @@ impl Source {
 #[cfg(unix)]
 struct Prepared {
     root: Option<walk::Root>,
-    /// The snapshot file this answer started from, if any.
-    snapshot: Option<std::path::PathBuf>,
     source: Source,
-    /// Whether the answer differs from the snapshot it started from, and
-    /// so has to be written back rather than just marked as confirmed.
-    changed: bool,
+    /// When the full walk this answer descends from began, or `None` when
+    /// there is nothing new to write: a catch-up that found no change.
+    walked: Option<walk::Time>,
     /// The change journal's position from before this operand was looked
     /// at, for the next catch-up to start from.
     journal: Option<index::Position>,
@@ -163,13 +170,13 @@ fn prepare(
     walker: &walk::Walker<'_>,
     index_dir: Option<&std::path::Path>,
     operand: &args::Operand,
+    started: walk::Time,
 ) -> Prepared {
     let args::Operand::Path(path) = operand else {
         return Prepared {
             root: None,
-            snapshot: None,
             source: Source::Walk,
-            changed: false,
+            walked: None,
             journal: None,
         };
     };
@@ -182,7 +189,8 @@ fn prepare(
     let wanted = options.max_age.is_some() || walker.reuses_listings();
     let snapshot = match (index_dir, root.meta) {
         (Some(dir), Ok(meta)) if wanted && walker.descends(&root) => {
-            index::Snapshot::load(index::Snapshot::file(dir, options, &meta))
+            let file = index::Snapshot::file(dir, options, &meta, &root.path);
+            index::Snapshot::load(&file)
         }
         _ => None,
     };
@@ -208,9 +216,8 @@ fn prepare(
         );
         return Prepared {
             root: Some(root),
-            snapshot: Some(snapshot.path().to_owned()),
             source,
-            changed,
+            walked: changed.then_some(snapshot.walked),
             journal,
         };
     }
@@ -219,14 +226,10 @@ fn prepare(
         .filter(|_| !options.fresh)
         .map(index::Snapshot::previous);
     walker.fill(&mut root, previous.as_ref());
-    let changed = snapshot
-        .as_ref()
-        .is_none_or(|snapshot| options.fresh || !index::same(snapshot, &root));
     Prepared {
         root: Some(root),
-        snapshot: snapshot.map(|snapshot| snapshot.path().to_owned()),
         source: Source::Walk,
-        changed,
+        walked: Some(started),
         journal,
     }
 }
@@ -251,7 +254,9 @@ fn run(program: &str, options: &args::Options) -> ExitCode {
     let prepared: Vec<Prepared> = options
         .operands
         .par_iter()
-        .map(|operand| prepare(options, &walker, index_dir.as_deref(), operand))
+        .map(|operand| {
+            prepare(options, &walker, index_dir.as_deref(), operand, started)
+        })
         .collect();
 
     // The index is written while the answer is printed; it is a cache, so
@@ -259,53 +264,52 @@ fn run(program: &str, options: &args::Options) -> ExitCode {
     let save = || {
         let Some(dir) = &index_dir else { return };
         prepared.par_iter().for_each(|p| {
-            let Some(root) = &p.root else { return };
-            match &p.snapshot {
-                Some(snapshot) if !p.changed => index::confirm(snapshot),
-                _ => {
-                    let _ = index::save(dir, options, root, started, p.journal);
-                }
+            if let (Some(root), Some(walked)) = (&p.root, p.walked) {
+                let _ =
+                    index::save(dir, options, root, started, walked, p.journal);
             }
         });
         index::prune(dir);
     };
     let (ok, ()) =
         rayon::join(|| answer(program, options, &prepared, started), save);
-    if ok == Some(true) {
+    if ok {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     }
 }
 
-/// Print the answer. `None` when standard output failed.
+/// Print the answer, and say whether all went well.
 #[cfg(unix)]
 fn answer(
     program: &str,
     options: &args::Options,
     prepared: &[Prepared],
     started: walk::Time,
-) -> Option<bool> {
+) -> bool {
     let roots: Vec<Option<&walk::Root>> =
         prepared.iter().map(|p| p.root.as_ref()).collect();
     if options.json {
         let sink = output::Json::new(options.units, options.inodes);
         let (ok, sink) = report_all(program, options, &roots, sink);
-        sink.write(index::system_time(started), source(prepared))
-            .ok()?;
-        Some(ok)
+        if let Err(error) =
+            sink.write(index::system_time(started), source(prepared))
+        {
+            output::write_failed(program, &error);
+        }
+        ok
     } else {
         let time_format =
             options.time.as_ref().map(|(_, format)| format.clone());
         let sink = output::Text::new(
+            program,
             options.units,
             options.inodes,
             time_format,
             options.null,
         );
-        let (ok, sink) = report_all(program, options, &roots, sink);
-        // Whoever was reading has gone; GNU would die of SIGPIPE.
-        (!sink.is_broken()).then_some(ok)
+        report_all(program, options, &roots, sink).0
     }
 }
 

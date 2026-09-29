@@ -101,16 +101,19 @@ const fn scale(value: &mut i128, by: i128, min: i128, max: i128) -> bool {
 }
 
 /// gnulib's `xstrtol` core, for a type bounded by `min..=max`.
+/// gnulib's `xstrtol` core, for a type bounded by `min..=max`. Like C, it
+/// stores a value even when it reports an error: the number as far as it
+/// was understood. `humblock` relies on that.
 fn xstrto(
     text: &[u8],
     suffixes: &[u8],
     min: i128,
     max: i128,
-) -> Result<i128, ParseError> {
+) -> (i128, Option<ParseError>) {
     if min == 0 {
         let first = text.iter().find(|b| !b.is_ascii_whitespace());
         if first == Some(&b'-') {
-            return Err(ParseError::Invalid);
+            return (0, Some(ParseError::Invalid));
         }
     }
     let (mut value, end, mut overflow) = match strto(text, min, max) {
@@ -119,20 +122,16 @@ fn xstrto(
             // No number but a valid suffix means one of that unit.
             match text.first() {
                 Some(first) if suffixes.contains(first) => (1, 0, false),
-                _ => return Err(ParseError::Invalid),
+                _ => return (0, Some(ParseError::Invalid)),
             }
         }
     };
     let rest = &text[end..];
     let Some(&unit) = rest.first() else {
-        return if overflow {
-            Err(ParseError::Overflow)
-        } else {
-            Ok(value)
-        };
+        return (value, overflow.then_some(ParseError::Overflow));
     };
     if !suffixes.contains(&unit) {
-        return Err(ParseError::InvalidSuffix);
+        return (value, Some(ParseError::InvalidSuffix));
     }
     let mut base = 1024;
     let mut consumed = 1;
@@ -170,29 +169,37 @@ fn xstrto(
         b'Y' => 8,
         b'R' => 9,
         b'Q' => 10,
-        _ => return Err(ParseError::InvalidSuffix),
+        _ => return (value, Some(ParseError::InvalidSuffix)),
     };
     for _ in 0..power {
         overflow |= scale(&mut value, base, min, max);
     }
     if rest.len() > consumed {
-        return Err(ParseError::InvalidSuffix);
+        return (value, Some(ParseError::InvalidSuffix));
     }
-    if overflow {
-        Err(ParseError::Overflow)
-    } else {
-        Ok(value)
-    }
+    (value, overflow.then_some(ParseError::Overflow))
 }
 
-pub fn xstrtoumax(text: &[u8], suffixes: &[u8]) -> Result<u64, ParseError> {
-    xstrto(text, suffixes, 0, i128::from(u64::MAX))
-        .map(|value| u64::try_from(value).unwrap_or(u64::MAX))
+fn fail_or<T>(value: T, error: Option<ParseError>) -> Result<T, ParseError> {
+    error.map_or(Ok(value), Err)
+}
+
+/// `xstrtoumax`: the value, and the error if there was one.
+fn xstrtoumax_raw(text: &[u8], suffixes: &[u8]) -> (u64, Option<ParseError>) {
+    let (value, error) = xstrto(text, suffixes, 0, i128::from(u64::MAX));
+    (u64::try_from(value).unwrap_or(u64::MAX), error)
+}
+
+#[cfg(test)]
+fn xstrtoumax(text: &[u8], suffixes: &[u8]) -> Result<u64, ParseError> {
+    let (value, error) = xstrtoumax_raw(text, suffixes);
+    fail_or(value, error)
 }
 
 pub fn xstrtoimax(text: &[u8], suffixes: &[u8]) -> Result<i64, ParseError> {
-    xstrto(text, suffixes, i128::from(i64::MIN), i128::from(i64::MAX))
-        .map(|value| i64::try_from(value).unwrap_or(i64::MAX))
+    let (value, error) =
+        xstrto(text, suffixes, i128::from(i64::MIN), i128::from(i64::MAX));
+    fail_or(i64::try_from(value).unwrap_or(i64::MAX), error)
 }
 
 /// The position just past what `xstrtoumax` consumed, for `humblock`'s
@@ -316,10 +323,12 @@ fn humblock(spec: &[u8]) -> (Units, Result<(), ParseError>) {
             Ok(()),
         );
     }
-    let block_size = match xstrtoumax(spec, SUFFIXES) {
-        Ok(size) => size,
-        Err(error) => return (Units::plain(0), Err(error)),
-    };
+    // On a bad spec gnulib keeps what `xstrtoumax` understood of it and
+    // drops the options, so `DU_BLOCK_SIZE=1x` still means one byte.
+    let (block_size, error) = xstrtoumax_raw(spec, SUFFIXES);
+    if let Some(error) = error {
+        return (Units::plain(block_size), Err(error));
+    }
     // A unit with no digit before it ("K", "MiB") also names the suffix
     // the sizes are printed with.
     let end = consumed_len(spec, SUFFIXES);
@@ -520,5 +529,7 @@ mod tests {
         assert_eq!(xstrtoimax(b"0x10", b""), Ok(16));
         assert_eq!(xstrtoimax(b"010", b""), Ok(8));
         assert_eq!(xstrtoumax(b"-1", b""), Err(ParseError::Invalid));
+        assert_eq!(humblock(b"1x").0, Units::plain(1));
+        assert_eq!(humblock(b"16Z").1, Err(ParseError::Overflow));
     }
 }

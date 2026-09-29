@@ -42,7 +42,7 @@ use crate::walk::{
     Entry, ListError, Listing, Meta, Root, Slot, StatError, Time,
 };
 
-const MAGIC: &[u8; 8] = b"DTDUIDX3";
+const MAGIC: &[u8; 8] = b"DTDUIDX4";
 
 /// How much older than the walk a directory's ctime must be before its
 /// listing is trusted. Two seconds covers file systems with one-second
@@ -70,7 +70,7 @@ pub fn directory() -> Option<PathBuf> {
 }
 
 /// The options that change what a walk records, folded into a name.
-fn fingerprint(options: &Options, root: &Meta) -> u64 {
+fn fingerprint(options: &Options, root: &Meta, spelled: &[u8]) -> u64 {
     // FNV-1a: stable across builds and runs, unlike the std hasher.
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut feed = |bytes: &[u8]| {
@@ -89,6 +89,12 @@ fn fingerprint(options: &Options, root: &Meta) -> u64 {
         },
         u8::from(options.one_file_system),
     ]);
+    // An exclude matches the path as the operand spells it, so with
+    // excludes `./a` and `a` walk differently.
+    if !options.excludes.is_empty() {
+        feed(&(spelled.len() as u64).to_le_bytes());
+        feed(spelled);
+    }
     for pattern in options.excludes.patterns() {
         feed(&(pattern.len() as u64).to_le_bytes());
         feed(pattern);
@@ -109,7 +115,6 @@ pub type Position = ([u8; 16], u64);
 /// One operand's snapshot, read back.
 #[derive(Debug)]
 pub struct Snapshot {
-    path: PathBuf,
     /// When the walk that produced it began.
     pub taken: Time,
     /// The journal's position then, where the volume keeps one.
@@ -118,21 +123,28 @@ pub struct Snapshot {
         allow(dead_code, reason = "only macOS keeps a journal to replay")
     )]
     pub journal: Option<Position>,
-    /// When it was last confirmed by a walk: the file's modification time.
-    pub confirmed: SystemTime,
+    /// When the last full walk it descends from began. A catch-up keeps
+    /// this, so `--max-age` bounds how long anything a catch-up cannot see
+    /// can go unseen.
+    pub walked: Time,
     pub root: Meta,
     pub tree: Arc<Slot>,
 }
 
 impl Snapshot {
     /// The file a snapshot of `root` under `options` lives in.
-    pub fn file(dir: &Path, options: &Options, root: &Meta) -> PathBuf {
-        dir.join(format!("{:016x}.idx", fingerprint(options, root)))
+    pub fn file(
+        dir: &Path,
+        options: &Options,
+        root: &Meta,
+        spelled: &[u8],
+    ) -> PathBuf {
+        let key = fingerprint(options, root, spelled);
+        dir.join(format!("{key:016x}.idx"))
     }
 
-    pub fn load(path: PathBuf) -> Option<Self> {
-        let bytes = fs::read(&path).ok()?;
-        let confirmed = fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+    pub fn load(path: &Path) -> Option<Self> {
+        let bytes = fs::read(path).ok()?;
         let mut reader = Reader {
             bytes: &bytes,
             at: 0,
@@ -141,6 +153,7 @@ impl Snapshot {
             return None;
         }
         let taken = reader.time()?;
+        let walked = reader.time()?;
         let journal = match reader.byte()? {
             0 => None,
             1 => {
@@ -156,23 +169,18 @@ impl Snapshot {
             return None;
         }
         Some(Self {
-            path,
             taken,
             journal,
-            confirmed,
+            walked,
             root,
             tree,
         })
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     /// Whether this snapshot is recent enough for `--max-age` to start from.
     pub fn young(&self, max_age: Duration) -> bool {
         SystemTime::now()
-            .duration_since(self.confirmed)
+            .duration_since(system_time(self.walked))
             .is_ok_and(|age| age <= max_age)
     }
 
@@ -229,45 +237,10 @@ impl Previous {
     }
 }
 
-/// Mark the snapshot at `path` as confirmed now, without rewriting it.
-pub fn confirm(path: &Path) {
-    if let Ok(file) = fs::File::options().append(true).open(path) {
-        let _ = file.set_modified(SystemTime::now());
-    }
-}
-
-/// Whether a walk found exactly what `snapshot` holds, in which case the
-/// snapshot only needs to be marked as confirmed.
-pub fn same(snapshot: &Snapshot, root: &Root) -> bool {
-    fn listings(a: &Listing, b: &Listing) -> bool {
-        a.error == b.error
-            && a.entries.len() == b.entries.len()
-            && a.entries.iter().zip(&b.entries).all(|(a, b)| {
-                a.name == b.name
-                    && a.d_ino == b.d_ino
-                    && match (&a.meta, &b.meta) {
-                        (Ok(a), Ok(b)) => a.unchanged(b),
-                        (a, b) => a == b,
-                    }
-                    && match (
-                        a.dir.as_deref().and_then(OnceLock::get),
-                        b.dir.as_deref().and_then(OnceLock::get),
-                    ) {
-                        (None, None) => true,
-                        (Some(a), Some(b)) => listings(a, b),
-                        _ => false,
-                    }
-            })
-    }
-    root.meta.is_ok_and(|meta| meta.unchanged(&snapshot.root))
-        && match (
-            snapshot.tree.get(),
-            root.dir.as_deref().and_then(OnceLock::get),
-        ) {
-            (Some(a), Some(b)) => listings(a, b),
-            _ => false,
-        }
-}
+/// Distinguishes the temporary files of concurrent writers: `du . $PWD`
+/// saves one snapshot twice at once.
+static WRITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Write `root`'s walk as a snapshot, replacing the file atomically.
 pub fn save(
@@ -275,6 +248,7 @@ pub fn save(
     options: &Options,
     root: &Root,
     taken: Time,
+    walked: Time,
     journal: Option<Position>,
 ) -> std::io::Result<()> {
     let (Ok(meta), Some(slot)) = (root.meta, &root.dir) else {
@@ -287,6 +261,7 @@ pub fn save(
     let mut out = Vec::with_capacity(1 << 16);
     out.extend_from_slice(MAGIC);
     put_time(&mut out, taken);
+    put_time(&mut out, walked);
     match journal {
         None => out.push(0),
         Some((uuid, event)) => {
@@ -297,8 +272,10 @@ pub fn save(
     }
     put_meta(&mut out, &meta, OWN_DEV | OWN_CTIME);
     put_listing(&mut out, listing, meta.dev);
-    let path = Snapshot::file(dir, options, &meta);
-    let temp = path.with_extension(format!("tmp{}", std::process::id()));
+    let path = Snapshot::file(dir, options, &meta, &root.path);
+    let write = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp =
+        path.with_extension(format!("tmp{}.{write}", std::process::id()));
     let result = (|| {
         let mut file = private_file(&temp)?;
         file.write_all(&out)?;
@@ -311,7 +288,7 @@ pub fn save(
     result
 }
 
-/// Drop the least recently confirmed snapshots beyond [`KEEP`].
+/// Drop the least recently written snapshots beyond [`KEEP`].
 pub fn prune(dir: &Path) {
     let Ok(read) = fs::read_dir(dir) else { return };
     let mut files: Vec<(SystemTime, PathBuf)> = read
@@ -549,6 +526,16 @@ impl Reader<'_> {
     }
 
     fn listing(&mut self, dev: u64) -> Option<Listing> {
+        self.listing_at(dev, 0)
+    }
+
+    /// A corrupt file must not become deep recursion or a huge allocation:
+    /// nesting is bounded by what a path can hold, and every entry takes at
+    /// least three bytes.
+    fn listing_at(&mut self, dev: u64, depth: usize) -> Option<Listing> {
+        if depth > 4096 {
+            return None;
+        }
         let error = match self.u64()? {
             0 => None,
             1 => Some(ListError::Unreadable(self.errno()?)),
@@ -557,7 +544,11 @@ impl Reader<'_> {
         };
         let count = usize::try_from(self.u64()?).ok()?;
         // A corrupt count must not become a huge allocation.
-        let mut entries = Vec::with_capacity(count.min(self.bytes.len()));
+        let left = self.bytes.len().saturating_sub(self.at);
+        if count > left / 3 {
+            return None;
+        }
+        let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
             let tag = self.byte()?;
             let len = usize::try_from(self.u64()?).ok()?;
@@ -581,7 +572,7 @@ impl Reader<'_> {
             let dir = if tag & HAS_DIR != 0 {
                 let child_dev = meta.map_or(dev, |meta| meta.dev);
                 let slot = Arc::new(Slot::new());
-                let _ = slot.set(self.listing(child_dev)?);
+                let _ = slot.set(self.listing_at(child_dev, depth + 1)?);
                 Some(slot)
             } else {
                 None
@@ -614,6 +605,15 @@ mod tests {
             atime: time,
             ctime: time,
         }
+    }
+
+    #[test]
+    fn a_corrupt_count_is_refused_not_allocated() {
+        let mut out = Vec::new();
+        put_u64(&mut out, 0);
+        put_u64(&mut out, u64::from(u32::MAX));
+        let mut reader = Reader { bytes: &out, at: 0 };
+        assert!(reader.listing(1).is_none());
     }
 
     #[test]
@@ -674,10 +674,9 @@ mod tests {
         let tree = Arc::new(Slot::new());
         let _ = tree.set(back);
         let snapshot = Snapshot {
-            path: PathBuf::new(),
             taken: Time { sec: 1000, nsec: 0 },
             journal: None,
-            confirmed: SystemTime::now(),
+            walked: Time { sec: 1000, nsec: 0 },
             root: meta(1, 10),
             tree,
         };

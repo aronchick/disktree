@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
-use rustix::fd::{AsFd, BorrowedFd};
+use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
 use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags, openat, statat};
 use rustix::io::Errno;
 
@@ -176,6 +176,80 @@ pub fn join(parent: &[u8], name: &[u8]) -> Vec<u8> {
     path
 }
 
+/// The directories above the one being listed, as a chain each task
+/// extends by one: a directory that is its own ancestor (a bind mount of
+/// one) is a cycle, which `fts` reports and du skips.
+struct Above {
+    key: (u64, u64),
+    up: Option<Arc<Self>>,
+}
+
+fn is_above(mut chain: Option<&Arc<Above>>, key: (u64, u64)) -> bool {
+    while let Some(link) = chain {
+        if link.key == key {
+            return true;
+        }
+        chain = link.up.as_ref();
+    }
+    false
+}
+
+/// Open a directory by path. A path longer than the system allows in one
+/// call is opened a piece at a time, each relative to the last, as `fts`
+/// does by keeping a descriptor for every level.
+pub fn open_dir(path: &[u8], flags: OFlags) -> Result<OwnedFd, Errno> {
+    // Comfortably below every PATH_MAX in use (1024 on macOS).
+    const PIECE: usize = 768;
+    match openat(CWD, path, flags, Mode::empty()) {
+        Err(Errno::NAMETOOLONG) => {}
+        other => return other,
+    }
+    let through = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let (mut at, rest) = match path.strip_prefix(b"/") {
+        Some(rest) => (Some(openat(CWD, "/", through, Mode::empty())?), rest),
+        None => (None, path),
+    };
+    let names: Vec<&[u8]> = rest
+        .split(|&b| b == b'/')
+        .filter(|n| !n.is_empty())
+        .collect();
+    let mut start = 0;
+    while start < names.len() {
+        let mut end = start;
+        let mut len = 0;
+        while end < names.len()
+            && (end == start || len + names[end].len() < PIECE)
+        {
+            len += names[end].len() + 1;
+            end += 1;
+        }
+        let piece = names[start..end].join(&b'/');
+        let last = end == names.len();
+        let piece_flags = if last { flags } else { through };
+        let next = match &at {
+            Some(dir) => {
+                openat(dir, piece.as_slice(), piece_flags, Mode::empty())
+            }
+            None => openat(CWD, piece.as_slice(), piece_flags, Mode::empty()),
+        }?;
+        at = Some(next);
+        start = end;
+    }
+    at.ok_or(Errno::NOENT)
+}
+
+/// `stat_at` by path, for paths of any length.
+pub fn stat_path(path: &[u8], follow: bool) -> Result<Meta, StatError> {
+    match stat_at(CWD, path, follow) {
+        Err(StatError::Errno(Errno::NAMETOOLONG)) => {}
+        other => return other,
+    }
+    let at = path.iter().rposition(|&b| b == b'/').unwrap_or(0);
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let dir = open_dir(&path[..at.max(1)], flags).map_err(StatError::Errno)?;
+    stat_at(dir.as_fd(), &path[at + 1..], follow)
+}
+
 /// What every task of one operand's walk shares.
 struct Context<'a> {
     root_dev: u64,
@@ -297,7 +371,7 @@ impl<'a> Walker<'a> {
             previous,
         };
         rayon::scope(|scope| {
-            self.list(scope, &context, &path, meta, true, &slot);
+            self.list(scope, &context, &path, meta, true, &slot, None);
         });
     }
 
@@ -326,7 +400,7 @@ impl<'a> Walker<'a> {
             previous: None,
         };
         rayon::scope(|scope| {
-            self.list(scope, &context, path, meta, false, &slot);
+            self.list(scope, &context, path, meta, false, &slot, None);
         });
         slot
     }
@@ -341,6 +415,10 @@ impl<'a> Walker<'a> {
         self.read(path, meta, is_root, None)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one task of the walk: the directory and where it sits"
+    )]
     fn list<'s>(
         &'s self,
         scope: &rayon::Scope<'s>,
@@ -349,14 +427,23 @@ impl<'a> Walker<'a> {
         meta: Meta,
         is_root: bool,
         slot: &Arc<Slot>,
+        above: Option<Arc<Above>>,
     ) {
         let root_dev = context.root_dev;
         let listing = self.read(path, meta, is_root, context.previous);
         let mut listing = listing;
+        let here = Arc::new(Above {
+            key: meta.key(),
+            up: above,
+        });
         for entry in &mut listing.entries {
             let Ok(child) = entry.meta else { continue };
             let child_path = join(path, &entry.name);
             if !self.enters(&child_path, &child, root_dev) {
+                continue;
+            }
+            // With `-L` the shared listings below end any cycle.
+            if self.deref != Deref::All && is_above(Some(&here), child.key()) {
                 continue;
             }
             let child_slot = if self.deref == Deref::All {
@@ -375,6 +462,7 @@ impl<'a> Walker<'a> {
                 Arc::new(Slot::new())
             };
             entry.dir = Some(Arc::clone(&child_slot));
+            let above = Some(Arc::clone(&here));
             scope.spawn(move |scope| {
                 self.list(
                     scope,
@@ -383,6 +471,7 @@ impl<'a> Walker<'a> {
                     child,
                     false,
                     &child_slot,
+                    above,
                 );
             });
         }
@@ -410,7 +499,7 @@ impl<'a> Walker<'a> {
         if nofollow {
             flags |= OFlags::NOFOLLOW;
         }
-        let fd = match openat(CWD, path, flags, Mode::empty()) {
+        let fd = match open_dir(path, flags) {
             Ok(fd) => fd,
             Err(errno) => {
                 return Listing {
