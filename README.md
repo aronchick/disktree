@@ -374,7 +374,7 @@ cargo install --locked --path crates/disktree-du
 ln -s "$(command -v disktree-du)" ~/.local/bin/du  # early on PATH
 ```
 
-It follows coreutils 9.11. `crates/disktree-du/tests/gnu.rs` runs 72
+It follows coreutils 9.11. `crates/disktree-du/tests/gnu.rs` runs 78
 argument sets against the GNU du it finds (`gdu` from Homebrew's coreutils,
 or a `du` that is GNU's) and compares output, messages and exit status. GNU
 du 9.4 and later match, apart from two corner cases GNU changed since then:
