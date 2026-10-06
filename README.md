@@ -374,20 +374,25 @@ tested:
 
 ## As `du`
 
-`disktree-du` is GNU du: the same options, the same output byte for byte,
-the same messages and exit status. Put it on `PATH` as `du` and whatever
-already runs `du`, coding agents included, gets it without learning
-anything new.
+`disktree --du` is GNU du: the same options, output, messages and exit
+status. It runs headless from the existing `disktree` binary, so it needs no
+display and adds no second binary to install. Everything after `--du` is a
+GNU du argument.
 
 ```sh
-cargo install --locked --path crates/disktree-du
-ln -s "$(command -v disktree-du)" ~/.local/bin/du  # early on PATH
+disktree --du -sh ~/src
+ln -s "$(command -v disktree)" ~/.local/bin/du  # early on PATH
+du -sh ~/src
 ```
 
-It follows coreutils 9.11. `crates/disktree-du/tests/gnu.rs` runs 78
-argument sets against the GNU du it finds (`gdu` from Homebrew's coreutils,
-or a `du` that is GNU's) and compares output, messages and exit status. GNU
-du 9.4 and later match, apart from two corner cases GNU changed since then:
+When invoked through a link whose basename is `du`, the same binary enters
+this mode automatically. Existing scripts and coding agents can keep calling
+`du` without learning a new command.
+
+It follows coreutils 9.11. `crates/disktree-app/tests/gnu.rs` runs 78 argument
+sets against the GNU du it finds (`gdu` from Homebrew's coreutils, or a `du`
+that is GNU's) and compares output, messages and exit status. GNU du 9.4 and
+later match, apart from two corner cases GNU changed since then:
 `--max-depth` below zero, and the wording of a bad `--time-style`.
 
 It is faster three ways:
@@ -409,9 +414,9 @@ On a 670 GB tree of 6.65 million entries (Apple M5 Max, APFS, warm cache):
 | command | time |
 | --- | --- |
 | GNU du 9.11, `du -s` | 148 s |
-| `disktree-du -s` | 25 s |
-| `disktree-du -s --max-age=1h`, through the journal | 2 to 3 s |
-| `disktree-du -s --max-age=1h`, by directory | 3.4 s |
+| `disktree --du -s` | 25 s |
+| `disktree --du -s --max-age=1h`, through the journal | 2 to 3 s |
+| `disktree --du -s --max-age=1h`, by directory | 3.4 s |
 
 Without `--max-age` every answer is a full walk, so it is what GNU du would
 say. With it, two things can be missed. A file still open for writing is not
@@ -480,7 +485,8 @@ gone while their neighbours are not.
 | `crates/disktree-app/src/treemap_view.rs` | painting the mosaic and its labels |
 | `crates/disktree-app/src/ui.rs` | the spacing, type and size scale, in `rem` |
 | `crates/disktree-app/src/tests.rs` | end-to-end tests through a real window |
-| `crates/disktree-du` | GNU du on a parallel walk, its snapshots, and the comparison against GNU |
+| `crates/disktree-core/src/du` | GNU du on a parallel walk and its snapshots |
+| `crates/disktree-app/tests/gnu.rs` | comparison against GNU du |
 | `packaging/`, `assets/`, `Makefile` | the desktop entry, the icon, and install |
 
 The interface follows the
