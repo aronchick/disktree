@@ -3,12 +3,12 @@
 use std::fmt::Write as _;
 use std::io::{BufWriter, Stdout, Write as _};
 
+use crate::classify::Reclaim;
 use chrono::{DateTime, Local};
-use disktree_core::classify::Reclaim;
 
-use crate::num::{Units, human_readable};
-use crate::report::{Dui, Kind, Line, Sink};
-use crate::walk::Time;
+use super::num::{Units, human_readable};
+use super::report::{Dui, Kind, Line, Sink};
+use super::walk::Time;
 
 /// `show_date`: strftime with GNU's `%N` for nanoseconds, in the local zone
 /// (which honours `TZ`). A format chrono cannot render falls back to the
@@ -69,7 +69,7 @@ pub fn write_failed(program: &str, error: &std::io::Error) -> ! {
     if error.kind() == std::io::ErrorKind::BrokenPipe {
         std::process::exit(141);
     }
-    eprintln!("{program}: write error: {}", crate::strerror(error));
+    eprintln!("{program}: write error: {}", super::strerror(error));
     std::process::exit(1);
 }
 

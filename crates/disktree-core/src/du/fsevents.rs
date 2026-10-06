@@ -8,7 +8,7 @@
 //! the journal was reset, and nothing it says can be relied on.
 //!
 //! The journal says nothing about a file still open for writing until it
-//! is closed; `crate::refresh` stats the files most likely to be in that
+//! is closed; `super::refresh` stats the files most likely to be in that
 //! state again whatever the journal says.
 
 #![allow(
@@ -140,7 +140,7 @@ pub fn volume_uuid(dev: u64) -> Option<[u8; 16]> {
     Some(bytes.bytes)
 }
 
-pub use crate::refresh::Changes;
+pub use super::refresh::Changes;
 
 struct Collector {
     changes: Changes,

@@ -9,8 +9,8 @@
 
 use rustc_hash::FxHashSet;
 
-use crate::args::{Options, TimeKind};
-use crate::walk::{
+use super::args::{Options, TimeKind};
+use super::walk::{
     Entry, ListError, Listing, Meta, Root, StatError, Time, join,
 };
 
@@ -40,8 +40,8 @@ impl Dui {
 /// that output was asked for.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Kind {
-    pub category: disktree_core::classify::Category,
-    pub reclaim: Option<disktree_core::classify::Reclaim>,
+    pub category: crate::classify::Category,
+    pub reclaim: Option<crate::classify::Reclaim>,
     /// Whether `reclaim` was decided by this entry's own name rather than
     /// inherited, which is where a clean command applies.
     pub reclaim_here: bool,
@@ -200,13 +200,13 @@ impl<'a, S: Sink> Report<'a, S> {
                         StatError::Dangling => {
                             format!(
                                 "cannot access {}",
-                                crate::quote::always(path)
+                                super::quote::always(path)
                             )
                         }
                         StatError::Errno(errno) => format!(
                             "cannot access {}: {}",
-                            crate::quote::always(path),
-                            crate::errno_text(*errno)
+                            super::quote::always(path),
+                            super::errno_text(*errno)
                         ),
                     };
                     self.error(&message);
@@ -255,8 +255,8 @@ impl<'a, S: Sink> Report<'a, S> {
             Some(ListError::Unreadable(errno)) => {
                 self.error(&format!(
                     "cannot read directory {}: {}",
-                    crate::quote::always(path),
-                    crate::errno_text(errno)
+                    super::quote::always(path),
+                    super::errno_text(errno)
                 ));
             }
             error => {
@@ -292,8 +292,8 @@ impl<'a, S: Sink> Report<'a, S> {
                     dir_type = false;
                     self.error(&format!(
                         "{}: {}",
-                        crate::quote::when_needed(path),
-                        crate::errno_text(errno)
+                        super::quote::when_needed(path),
+                        super::errno_text(errno)
                     ));
                 }
             }
@@ -319,7 +319,7 @@ impl<'a, S: Sink> Report<'a, S> {
 }
 
 fn root_kind(path: &[u8]) -> Kind {
-    use disktree_core::classify::{Category, category_of_name, reclaim_of};
+    use crate::classify::{Category, category_of_name, reclaim_of};
     let trimmed = path.strip_suffix(b"/").unwrap_or(path);
     let (parent, name) = match trimmed.iter().rposition(|&b| b == b'/') {
         Some(at) => (&trimmed[..at.max(1)], &trimmed[at + 1..]),
@@ -343,7 +343,7 @@ fn root_kind(path: &[u8]) -> Kind {
 }
 
 fn child_kind(parent: Kind, entry: &Entry, siblings: &[Entry]) -> Kind {
-    use disktree_core::classify::{category_of_name, reclaim_of};
+    use crate::classify::{category_of_name, reclaim_of};
     let is_dir = entry.meta.is_ok_and(|meta| meta.is_dir());
     if !is_dir {
         return Kind {

@@ -1,4 +1,4 @@
-//! disktree-du against GNU du itself: the same fixture, the same arguments,
+//! `disktree --du` against GNU du itself: the same fixture and arguments,
 //! and the output, the diagnostics and the exit status compared byte for
 //! byte. Each case runs three times: without an index, with the index the
 //! first run left, and with `--max-age` answering from it.
@@ -13,7 +13,7 @@ use std::process::{Command, Output};
 
 use rustix::fs::{Mode, OFlags, mkdirat, openat};
 
-/// The coreutils release disktree-du follows. Older ones differ in a few
+/// The coreutils release `disktree --du` follows. Older ones differ in a few
 /// places, listed in [`CHANGED_SINCE`].
 const FOLLOWS: (u32, u32) = (9, 11);
 
@@ -147,6 +147,9 @@ fn run(
     env: &[(&str, &Path)],
 ) -> Output {
     let mut command = Command::new(program);
+    if program == Path::new(env!("CARGO_BIN_EXE_disktree")) {
+        command.arg("--du");
+    }
     command
         .args(args)
         .current_dir(cwd)
@@ -264,11 +267,12 @@ fn matches_gnu_du() {
     std::fs::set_permissions(&listed, std::fs::Permissions::from_mode(0o644))
         .expect("chmod");
 
-    // Named as GNU's binary is, so both prefix diagnostics the same way.
+    // A link named `du` selects the multicall personality. The comparison
+    // normalizes program names because Homebrew installs GNU du as `gdu`.
     let bin = base.join("bin");
     std::fs::create_dir_all(&bin).expect("mkdir");
-    let ours = bin.join(gnu.file_name().expect("name"));
-    symlink(env!("CARGO_BIN_EXE_disktree-du"), &ours).expect("symlink");
+    let ours = bin.join("du");
+    symlink(env!("CARGO_BIN_EXE_disktree"), &ours).expect("symlink");
     let harness = Harness {
         ours,
         gnu,
@@ -390,7 +394,7 @@ fn json_describes_what_du_prints() {
     write(&root.join("proj/target/debug/app"), 50_000);
     write(&root.join("proj/src/main.rs"), 100);
     let output = run(
-        Path::new(env!("CARGO_BIN_EXE_disktree-du")),
+        Path::new(env!("CARGO_BIN_EXE_disktree")),
         root,
         &["--json", "-d", "1", "proj"],
         &[("DISKTREE_DU_INDEX_DIR", &root.join("index"))],
@@ -433,7 +437,7 @@ fn catches_up(journal: bool) {
     }
     write(&root.join("e/gone"), 9000);
     let index = root.join("index");
-    let du = Path::new(env!("CARGO_BIN_EXE_disktree-du"));
+    let du = Path::new(env!("CARGO_BIN_EXE_disktree"));
     let off = Path::new("0");
     let mut env = vec![("DISKTREE_DU_INDEX_DIR", index.as_path())];
     if !journal {
@@ -497,7 +501,7 @@ fn the_journal_is_matched_in_the_case_on_disk() {
         return;
     }
     let index = root.join("index");
-    let du = Path::new(env!("CARGO_BIN_EXE_disktree-du"));
+    let du = Path::new(env!("CARGO_BIN_EXE_disktree"));
     let hour = Path::new("1h");
     let env = [
         ("DISKTREE_DU_INDEX_DIR", index.as_path()),

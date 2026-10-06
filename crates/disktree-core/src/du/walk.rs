@@ -2,7 +2,7 @@
 //! all cores, keeping each directory's entries in the order GNU's `fts`
 //! would visit them. Nothing here decides what counts; hard links, `-x`,
 //! `--exclude` and the depth rules are applied afterwards, in order, by
-//! [`crate::report`], because which of two links is "first" depends on the
+//! [`super::report`], because which of two links is "first" depends on the
 //! order of the walk and a parallel walk has none.
 //!
 //! The order is `fts`'s: `readdir` order, except that a directory read in a
@@ -18,9 +18,9 @@ use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
 use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags, openat, statat};
 use rustix::io::Errno;
 
-use crate::args::Deref;
-use crate::exclude::Excludes;
-use crate::index::Previous;
+use super::args::Deref;
+use super::exclude::Excludes;
+use super::index::Previous;
 
 /// `FTS_INODE_SORT_DIR_ENTRIES_THRESHOLD` and `FTS_MAX_READDIR_ENTRIES`.
 const INODE_SORT_THRESHOLD: usize = 10_000;
@@ -144,7 +144,7 @@ pub struct Root {
 /// Whether the bulk attribute listing is in use.
 #[cfg(target_os = "macos")]
 fn bulk_enabled() -> bool {
-    crate::bulk::enabled()
+    super::bulk::enabled()
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -513,8 +513,8 @@ impl<'a> Walker<'a> {
         // stats at once, which is cheaper than any listing the index could
         // save a `readdir` of.
         #[cfg(target_os = "macos")]
-        if let Some((items, failed)) = (!follow && crate::bulk::enabled())
-            .then(|| crate::bulk::read(fd.as_fd()))
+        if let Some((items, failed)) = (!follow && super::bulk::enabled())
+            .then(|| super::bulk::read(fd.as_fd()))
             .flatten()
         {
             let sort = inode_sort_useful(fd.as_fd());
@@ -604,9 +604,9 @@ fn sort_batch(batch: &mut [(Box<[u8]>, u64)], useful: bool) {
 #[cfg(target_os = "macos")]
 fn stat_missing(
     dir: BorrowedFd<'_>,
-    items: Vec<crate::bulk::Item>,
+    items: Vec<super::bulk::Item>,
 ) -> Vec<Entry> {
-    let finish = |item: crate::bulk::Item| {
+    let finish = |item: super::bulk::Item| {
         let meta = match item.meta {
             Some(meta) => Ok(meta),
             None => stat_at(dir, &item.name, false),

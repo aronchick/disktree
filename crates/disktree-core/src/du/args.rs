@@ -11,9 +11,9 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::time::Duration;
 
-use crate::exclude::Excludes;
-use crate::num::{self, ParseError, Units};
-use crate::quote;
+use super::exclude::Excludes;
+use super::num::{self, ParseError, Units};
+use super::quote;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Deref {
@@ -551,7 +551,7 @@ pub fn parse(program: &Program, args: &[OsString]) -> Parsed {
                 Err(error) => parser.fail(&format!(
                     "{}: {}",
                     quote::when_needed(arg),
-                    crate::strerror(&error)
+                    super::strerror(&error)
                 )),
             },
             Opt::Files0From => files0_from = Some(arg.to_vec()),
@@ -654,7 +654,7 @@ pub fn parse(program: &Program, args: &[OsString]) -> Parsed {
                     parser.error(&format!(
                         "cannot open {} for reading: {}",
                         quote::always(&from),
-                        crate::strerror(&error)
+                        super::strerror(&error)
                     ));
                     return Parsed::Exit(1);
                 }
@@ -688,7 +688,7 @@ pub fn parse(program: &Program, args: &[OsString]) -> Parsed {
             options.operands.push(Operand::Invalid(format!(
                 "{}: read error: {}",
                 quote::when_needed(&from),
-                crate::strerror(&error)
+                super::strerror(&error)
             )));
         }
         options.hash_all = true;

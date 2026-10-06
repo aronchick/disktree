@@ -23,7 +23,7 @@
 //!
 //! * Caught up, with `--max-age`. A snapshot younger than the age asked for
 //!   is brought up to date from what changed since, without walking the
-//!   rest: see `crate::refresh`.
+//!   rest: see `super::refresh`.
 //!
 //! The format is private to this version: a snapshot that does not parse
 //! exactly is treated as missing.
@@ -37,8 +37,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rustc_hash::FxHashMap;
 use rustix::io::Errno;
 
-use crate::args::{Deref, Options};
-use crate::walk::{
+use super::args::{Deref, Options};
+use super::walk::{
     Entry, ListError, Listing, Meta, Root, Slot, StatError, Time,
 };
 
@@ -109,7 +109,7 @@ pub const fn indexable(options: &Options) -> bool {
 }
 
 /// Where a change journal stood when a snapshot's walk began: the
-/// volume's journal UUID and the event id. See `crate::fsevents`.
+/// volume's journal UUID and the event id. See `super::fsevents`.
 pub type Position = ([u8; 16], u64);
 
 /// One operand's snapshot, read back.

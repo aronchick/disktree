@@ -24,7 +24,7 @@ use std::sync::Arc;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::walk::{
+use super::walk::{
     Entry, Listing, Meta, Root, Slot, Time, Walker, join, stat_path,
 };
 

@@ -1,8 +1,8 @@
-//! `du`, answered by disktree: GNU du's command line and output, byte for
+//! GNU `du`, answered by disktree: its command line and output, byte for
 //! byte, from a walk that uses every core and remembers what it saw.
 //!
-//! Installed as `disktree-du`, and meant to be linked as `du` somewhere
-//! early on `PATH` so that whatever already runs `du` gets it.
+//! The existing `disktree` binary calls this module for its `--du` mode and
+//! when invoked through a link named `du`.
 
 // On Windows only the command line is parsed; nothing is walked or printed.
 #![cfg_attr(
@@ -30,11 +30,12 @@ mod report;
 #[cfg(unix)]
 mod walk;
 
+use std::ffi::OsString;
 use std::process::ExitCode;
 
 /// `strerror` for an I/O error, without Rust's " (os error N)" suffix: du
 /// prints the C library's text.
-pub fn strerror(error: &std::io::Error) -> String {
+fn strerror(error: &std::io::Error) -> String {
     let text = error.to_string();
     match text.rfind(" (os error ") {
         Some(at) => text[..at].to_owned(),
@@ -43,19 +44,16 @@ pub fn strerror(error: &std::io::Error) -> String {
 }
 
 #[cfg(unix)]
-pub fn errno_text(errno: rustix::io::Errno) -> String {
+fn errno_text(errno: rustix::io::Errno) -> String {
     strerror(&std::io::Error::from_raw_os_error(errno.raw_os_error()))
 }
 
-fn main() -> ExitCode {
-    let mut argv = std::env::args_os();
-    let argv0 = argv
-        .next()
-        .map(std::ffi::OsString::into_encoded_bytes)
-        .unwrap_or_default();
-    let program = args::Program::new(&argv0);
-    let rest: Vec<_> = argv.collect();
-    match args::parse(&program, &rest) {
+/// Run the GNU `du` personality with the supplied program name and arguments.
+///
+/// `argv0` controls diagnostics and help exactly as it does for GNU `du`.
+pub fn run(argv0: &[u8], arguments: &[OsString]) -> ExitCode {
+    let program = args::Program::new(argv0);
+    match args::parse(&program, arguments) {
         args::Parsed::Exit(code) => {
             ExitCode::from(u8::try_from(code).unwrap_or(1))
         }
@@ -65,8 +63,8 @@ fn main() -> ExitCode {
             let pool =
                 rayon::ThreadPoolBuilder::new().stack_size(64 << 20).build();
             match pool {
-                Ok(pool) => pool.install(|| run(&program.short, &options)),
-                Err(_) => run(&program.short, &options),
+                Ok(pool) => pool.install(|| execute(&program.short, &options)),
+                Err(_) => execute(&program.short, &options),
             }
         }
     }
@@ -235,7 +233,7 @@ fn prepare(
 }
 
 #[cfg(unix)]
-fn run(program: &str, options: &args::Options) -> ExitCode {
+fn execute(program: &str, options: &args::Options) -> ExitCode {
     use rayon::prelude::*;
 
     let walker = walk::Walker::new(
@@ -349,7 +347,7 @@ fn report_all<S: report::Sink>(
 }
 
 #[cfg(not(unix))]
-fn run(program: &str, _options: &args::Options) -> ExitCode {
+fn execute(program: &str, _options: &args::Options) -> ExitCode {
     eprintln!(
         "{program}: GNU du needs st_dev, st_ino and st_blocks, which this \
          system does not have; use the disktree window instead"

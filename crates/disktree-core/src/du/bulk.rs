@@ -26,7 +26,7 @@ use std::os::fd::AsRawFd as _;
 use rustix::fd::BorrowedFd;
 use rustix::io::Errno;
 
-use crate::walk::{Meta, Time};
+use super::walk::{Meta, Time};
 
 /// `ATTR_CMN_ERROR`, which the libc crate does not declare.
 const ATTR_CMN_ERROR: u32 = 0x2000_0000;
